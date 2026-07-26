@@ -1,7 +1,6 @@
 import { app, BrowserWindow, Menu, session, net as electronNet, WebContents, utilityProcess } from 'electron/main';
 
 import { assert, expect } from 'chai';
-import * as semver from 'semver';
 
 import * as cp from 'node:child_process';
 import { once } from 'node:events';
@@ -717,8 +716,6 @@ describe('app module', () => {
       '/f',
       '/d'
     ];
-    const productVersion = isMac ? cp.execSync('sw_vers -productVersion').toString().trim() : '';
-    const isVenturaOrHigher = semver.gt(semver.coerce(productVersion) || '0.0.0', '13.0.0');
 
     beforeEach(() => {
       app.setLoginItemSettings({ openAtLogin: false });
@@ -737,21 +734,15 @@ describe('app module', () => {
 
       const settings = app.getLoginItemSettings();
       expect(settings.openAtLogin).to.equal(true);
-      expect(settings.openAsHidden).to.equal(false);
       expect(settings.wasOpenedAtLogin).to.equal(false);
-      expect(settings.wasOpenedAsHidden).to.equal(false);
-      expect(settings.restoreState).to.equal(false);
-      if (isVenturaOrHigher) expect(settings.status).to.equal('enabled');
+      expect(settings.status).to.equal('enabled');
     });
 
     ifit(isWin)('sets and returns the app as a login item (windows)', () => {
       app.setLoginItemSettings({ openAtLogin: true, enabled: true });
       expect(app.getLoginItemSettings()).to.deep.equal({
         openAtLogin: true,
-        openAsHidden: false,
         wasOpenedAtLogin: false,
-        wasOpenedAsHidden: false,
-        restoreState: false,
         executableWillLaunchAtLogin: true,
         launchItems: [
           {
@@ -768,10 +759,7 @@ describe('app module', () => {
       app.setLoginItemSettings({ openAtLogin: true, enabled: false });
       expect(app.getLoginItemSettings()).to.deep.equal({
         openAtLogin: true,
-        openAsHidden: false,
         wasOpenedAtLogin: false,
-        wasOpenedAsHidden: false,
-        restoreState: false,
         executableWillLaunchAtLogin: false,
         launchItems: [
           {
@@ -780,41 +768,6 @@ describe('app module', () => {
             args: [],
             scope: 'user',
             enabled: false
-          }
-        ]
-      });
-    });
-
-    ifit(!isWin)('adds a login item that loads in hidden mode', () => {
-      app.setLoginItemSettings({ openAtLogin: true, openAsHidden: true });
-
-      const settings = app.getLoginItemSettings();
-      expect(settings.openAtLogin).to.equal(true);
-
-      const hasOpenAsHidden = process.platform === 'darwin' && !isVenturaOrHigher;
-      expect(settings.openAsHidden).to.equal(hasOpenAsHidden);
-      expect(settings.wasOpenedAtLogin).to.equal(false);
-      expect(settings.wasOpenedAsHidden).to.equal(false);
-      expect(settings.restoreState).to.equal(false);
-      if (isVenturaOrHigher) expect(settings.status).to.equal('enabled');
-    });
-
-    ifit(isWin)('adds a login item that loads in hidden mode (windows)', () => {
-      app.setLoginItemSettings({ openAtLogin: true, openAsHidden: true });
-      expect(app.getLoginItemSettings()).to.deep.equal({
-        openAtLogin: true,
-        openAsHidden: false,
-        wasOpenedAtLogin: false,
-        wasOpenedAsHidden: false,
-        restoreState: false,
-        executableWillLaunchAtLogin: true,
-        launchItems: [
-          {
-            name: 'electron.app.Electron',
-            path: process.execPath,
-            args: [],
-            scope: 'user',
-            enabled: true
           }
         ]
       });
@@ -830,21 +783,8 @@ describe('app module', () => {
       expect(app.getLoginItemSettings().openAtLogin).to.equal(false);
     });
 
-    ifit(isMac)('correctly sets and unsets the LoginItem as hidden', () => {
-      expect(app.getLoginItemSettings().openAtLogin).to.equal(false);
-      expect(app.getLoginItemSettings().openAsHidden).to.equal(false);
-
-      app.setLoginItemSettings({ openAtLogin: true, openAsHidden: true });
-      expect(app.getLoginItemSettings().openAtLogin).to.equal(true);
-      expect(app.getLoginItemSettings().openAsHidden).to.equal(!isVenturaOrHigher);
-
-      app.setLoginItemSettings({ openAtLogin: true, openAsHidden: false });
-      expect(app.getLoginItemSettings().openAtLogin).to.equal(true);
-      expect(app.getLoginItemSettings().openAsHidden).to.equal(false);
-    });
-
     ifdescribe(isMac)('using SMAppService', () => {
-      ifit(isVenturaOrHigher)('can set a login item', () => {
+      it('can set a login item', () => {
         app.setLoginItemSettings({
           openAtLogin: true,
           type: 'mainAppService'
@@ -853,15 +793,12 @@ describe('app module', () => {
         expect(app.getLoginItemSettings()).to.deep.equal({
           status: 'enabled',
           openAtLogin: true,
-          openAsHidden: false,
-          restoreState: false,
           wasOpenedAtLogin: false,
-          wasOpenedAsHidden: false,
           executableWillLaunchAtLogin: false
         });
       });
 
-      ifit(isVenturaOrHigher)('throws when setting non-default type with no name', () => {
+      it('throws when setting non-default type with no name', () => {
         expect(() => {
           app.setLoginItemSettings({
             openAtLogin: true,
@@ -870,7 +807,7 @@ describe('app module', () => {
         }).to.throw(/'name' is required when type is not mainAppService/);
       });
 
-      ifit(isVenturaOrHigher)('throws when getting non-default type with no name', () => {
+      it('throws when getting non-default type with no name', () => {
         expect(() => {
           app.getLoginItemSettings({
             type: 'daemonService'
@@ -878,7 +815,7 @@ describe('app module', () => {
         }).to.throw(/'name' is required when type is not mainAppService/);
       });
 
-      ifit(isVenturaOrHigher)('can unset a login item', () => {
+      it('can unset a login item', () => {
         app.setLoginItemSettings({
           openAtLogin: true,
           type: 'mainAppService'
@@ -892,10 +829,7 @@ describe('app module', () => {
         expect(app.getLoginItemSettings()).to.deep.equal({
           status: 'not-registered',
           openAtLogin: false,
-          openAsHidden: false,
-          restoreState: false,
           wasOpenedAtLogin: false,
-          wasOpenedAsHidden: false,
           executableWillLaunchAtLogin: false
         });
       });
@@ -936,10 +870,7 @@ describe('app module', () => {
       app.setLoginItemSettings({ openAtLogin: true, name: 'additionalEntry', enabled: false });
       expect(app.getLoginItemSettings()).to.deep.equal({
         openAtLogin: true,
-        openAsHidden: false,
         wasOpenedAtLogin: false,
-        wasOpenedAsHidden: false,
-        restoreState: false,
         executableWillLaunchAtLogin: true,
         launchItems: [
           {
@@ -962,10 +893,7 @@ describe('app module', () => {
       app.setLoginItemSettings({ openAtLogin: false, name: 'additionalEntry' });
       expect(app.getLoginItemSettings()).to.deep.equal({
         openAtLogin: true,
-        openAsHidden: false,
         wasOpenedAtLogin: false,
-        wasOpenedAsHidden: false,
-        restoreState: false,
         executableWillLaunchAtLogin: true,
         launchItems: [
           {
@@ -984,10 +912,7 @@ describe('app module', () => {
       app.setLoginItemSettings({ openAtLogin: true, name: 'additionalEntry', enabled: false, args: ['arg2'] });
       expect(app.getLoginItemSettings()).to.deep.equal({
         openAtLogin: false,
-        openAsHidden: false,
         wasOpenedAtLogin: false,
-        wasOpenedAsHidden: false,
-        restoreState: false,
         executableWillLaunchAtLogin: true,
         launchItems: [
           {
@@ -1011,10 +936,7 @@ describe('app module', () => {
     ifit(isWin)('finds launch items independent of path quotation or casing', () => {
       const expectation = {
         openAtLogin: false,
-        openAsHidden: false,
         wasOpenedAtLogin: false,
-        wasOpenedAsHidden: false,
-        restoreState: false,
         executableWillLaunchAtLogin: true,
         launchItems: [
           {
@@ -1064,10 +986,7 @@ describe('app module', () => {
       await once(appProcess, 'exit');
       expect(app.getLoginItemSettings()).to.deep.equal({
         openAtLogin: false,
-        openAsHidden: false,
         wasOpenedAtLogin: false,
-        wasOpenedAsHidden: false,
-        restoreState: false,
         executableWillLaunchAtLogin: false,
         launchItems: [
           {
@@ -1084,10 +1003,7 @@ describe('app module', () => {
     ifit(isWin)('detects enabled by TaskManager', async () => {
       const expectation = {
         openAtLogin: false,
-        openAsHidden: false,
         wasOpenedAtLogin: false,
-        wasOpenedAsHidden: false,
-        restoreState: false,
         executableWillLaunchAtLogin: true,
         launchItems: [
           {
