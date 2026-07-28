@@ -3,7 +3,6 @@
 // found in the LICENSE file.
 
 #include "base/callback_list.h"
-#include "content/public/browser/browser_context.h"
 #include "shell/browser/javascript_environment.h"
 #include "shell/browser/web_contents_preferences.h"
 #include "shell/browser/web_contents_zoom_controller.h"
