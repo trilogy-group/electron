@@ -1,0 +1,389 @@
+# TimeBack: build patched Electron on the same runner *labels* TimeBack Frontend uses,
+# then publish binaries to GitHub Releases and the npm package to GitHub Packages.
+#
+# Reuses machines only (macos-latest-xlarge / wseng-windows-latest-8vcpu).
+# Does NOT reuse Electron upstream publish pipelines or TimeBack app build-template.
+#
+# Publish destinations:
+#   1) GitHub Releases  → https://github.com/trilogy-group/electron/releases
+#      (binaries consumed via ELECTRON_MIRROR / @electron/get)
+#   2) GitHub Packages  → @trilogy-group/electron on npm.pkg.github.com
+#      (thin npm installer package; install pulls zips from the Release above)
+
+name: TimeBack Build & Publish Electron
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'npm/release version (override_electron_version)'
+        required: true
+        default: '43.2.0-timeback.1'
+      publish:
+        description: 'Create GitHub Release + publish @trilogy-group/electron'
+        type: boolean
+        default: true
+      build_mac:
+        description: 'Build macOS (arm64 on macos-latest-xlarge)'
+        type: boolean
+        default: true
+      build_win:
+        description: 'Build Windows (x64 on wseng-windows-latest-8vcpu)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+concurrency:
+  group: timeback-electron-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ELECTRON_VERSION: ${{ inputs.version }}
+  # Point @electron/get at this fork's Releases when publishing the npm package.
+  TIMEBACK_ELECTRON_MIRROR: https://github.com/trilogy-group/electron/releases/download/
+
+jobs:
+  build-mac:
+    if: ${{ inputs.build_mac }}
+    name: Build macOS arm64
+    runs-on: macos-latest-xlarge
+    timeout-minutes: 720
+    steps:
+      - name: Checkout workflow helpers
+        uses: actions/checkout@v4
+        with:
+          path: workflow-repo
+          fetch-depth: 1
+
+      - name: Free disk space (macOS)
+        uses: ./workflow-repo/.github/actions/free-space-macos
+
+      - name: Check disk
+        run: df -h
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.x'
+
+      - name: Install @electron/build-tools
+        run: |
+          npm i -g @electron/build-tools
+          e auto-update disable
+          e d auto-update disable
+          echo "$HOME/.electron_build_tools/third_party/depot_tools" >> "$GITHUB_PATH"
+          echo "$HOME/.electron_build_tools/third_party/depot_tools/python-bin" >> "$GITHUB_PATH"
+
+      - name: Init Electron checkout (fork + release config)
+        run: |
+          set -euo pipefail
+          ROOT="$HOME/electron-gn"
+          mkdir -p "$ROOT"
+          # -i release → out/Release; --remote-build none → no Electron RBE
+          e init timeback-mac \
+            --root="$ROOT" \
+            --fork=trilogy-group/electron \
+            -i release \
+            --remote-build none \
+            --use-https
+
+          cd "$ROOT/src/electron"
+          # e init checks out upstream main; switch to this workflow's commit (patched branch).
+          git remote add timeback "https://github.com/trilogy-group/electron.git" 2>/dev/null || true
+          git fetch --depth=1 timeback "${{ github.sha }}"
+          git checkout --force FETCH_HEAD
+          git clean -fdx
+          echo "Electron HEAD: $(git rev-parse --short HEAD)"
+          echo "Branch tip patches:"
+          tail -n 8 patches/chromium/.patches
+
+      - name: Sync (gclient + apply Chromium patches)
+        run: e sync -f
+        env:
+          DEPOT_TOOLS_UPDATE: 0
+
+      - name: Build Electron (release)
+        run: |
+          # override_electron_version so zip/npm version is 43.2.0-timeback.1 (not upstream tag)
+          CI=1 GN_EXTRA_ARGS="override_electron_version=\"${ELECTRON_VERSION}\"" e build --no-remote
+
+      - name: Package dist.zip
+        run: |
+          set -euo pipefail
+          ROOT="$HOME/electron-gn"
+          OUT="$ROOT/src/out/Release"
+          if [ ! -d "$OUT" ]; then
+            OUT="$ROOT/src/out/Default"
+          fi
+          echo "OUT=$OUT"
+          ninja -C "$OUT" electron:electron_dist_zip
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            arm64) PLATFORM_ARCH=arm64 ;;
+            x86_64) PLATFORM_ARCH=x64 ;;
+            *) PLATFORM_ARCH="$ARCH" ;;
+          esac
+          ARTIFACT="electron-v${ELECTRON_VERSION}-darwin-${PLATFORM_ARCH}.zip"
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cp "$OUT/dist.zip" "$GITHUB_WORKSPACE/artifacts/$ARTIFACT"
+          ls -lh "$GITHUB_WORKSPACE/artifacts"
+
+      - name: Upload mac artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: electron-darwin-arm64
+          path: artifacts/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  build-win:
+    if: ${{ inputs.build_win }}
+    name: Build Windows x64
+    runs-on: wseng-windows-latest-8vcpu
+    timeout-minutes: 720
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout workflow helpers
+        uses: actions/checkout@v4
+        with:
+          path: workflow-repo
+          fetch-depth: 1
+
+      - name: Check disk / toolchain
+        run: |
+          df -h || true
+          echo "VS installs:"
+          ls "/c/Program Files/Microsoft Visual Studio" 2>/dev/null || ls "/c/Program Files (x86)/Microsoft Visual Studio" 2>/dev/null || echo "No Visual Studio found"
+          which cl || true
+          python3 --version || python --version
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.x'
+
+      - name: Configure git for Windows Chromium
+        run: |
+          git config --global core.filemode false
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+          git config --global core.fscache true
+          git config --global core.preloadindex true
+
+      - name: Install @electron/build-tools
+        run: |
+          npm i -g @electron/build-tools
+          e auto-update disable
+          e d auto-update disable
+          echo "$HOME/.electron_build_tools/third_party/depot_tools" >> "$GITHUB_PATH"
+          echo "$HOME/.electron_build_tools/third_party/depot_tools/python-bin" >> "$GITHUB_PATH"
+
+      - name: Init Electron checkout (fork + release config)
+        run: |
+          set -euo pipefail
+          ROOT="$HOME/electron-gn"
+          mkdir -p "$ROOT"
+          e init timeback-win \
+            --root="$ROOT" \
+            --fork=trilogy-group/electron \
+            -i release \
+            --remote-build none \
+            --use-https
+
+          cd "$ROOT/src/electron"
+          git remote add timeback "https://github.com/trilogy-group/electron.git" 2>/dev/null || true
+          git fetch --depth=1 timeback "${{ github.sha }}"
+          git checkout --force FETCH_HEAD
+          git clean -fdx
+          echo "Electron HEAD: $(git rev-parse --short HEAD)"
+          tail -n 8 patches/chromium/.patches
+
+      - name: Sync (gclient + apply Chromium patches)
+        run: e sync -f
+        env:
+          DEPOT_TOOLS_UPDATE: 0
+
+      - name: Build Electron (release)
+        run: |
+          CI=1 GN_EXTRA_ARGS="override_electron_version=\"${ELECTRON_VERSION}\"" e build --no-remote
+
+      - name: Package dist.zip
+        run: |
+          set -euo pipefail
+          ROOT="$HOME/electron-gn"
+          OUT="$ROOT/src/out/Release"
+          if [ ! -d "$OUT" ]; then
+            OUT="$ROOT/src/out/Default"
+          fi
+          ninja -C "$OUT" electron:electron_dist_zip
+          ARTIFACT="electron-v${ELECTRON_VERSION}-win32-x64.zip"
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cp "$OUT/dist.zip" "$GITHUB_WORKSPACE/artifacts/$ARTIFACT"
+          ls -lh "$GITHUB_WORKSPACE/artifacts"
+
+      - name: Upload win artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: electron-win32-x64
+          path: artifacts/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish Release + npm
+    needs: [build-mac, build-win]
+    if: ${{ always() && inputs.publish && (needs.build-mac.result == 'success' || needs.build-win.result == 'success') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout npm package sources
+        uses: actions/checkout@v4
+        with:
+          path: electron
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-zips
+          pattern: electron-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: |
+          find dist-zips -type f -print
+          ls -lah dist-zips
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="v${ELECTRON_VERSION}"
+          TITLE="TimeBack Electron ${ELECTRON_VERSION}"
+          NOTES="Patched Electron build for TimeBack (five Chromium crash patches).
+
+          ## Install (npm / GitHub Packages)
+          \`\`\`bash
+          npm install @trilogy-group/electron@${ELECTRON_VERSION} --registry=https://npm.pkg.github.com
+          \`\`\`
+
+          Or keep \`electron@${ELECTRON_VERSION}\` and set:
+          \`\`\`
+          ELECTRON_MIRROR=https://github.com/trilogy-group/electron/releases/download/
+          \`\`\`
+
+          Branch: \`${{ github.ref_name }}\`
+          Commit: \`${{ github.sha }}\`"
+
+          if gh release view "$TAG" -R trilogy-group/electron >/dev/null 2>&1; then
+            echo "Release $TAG already exists — uploading/replacing assets"
+            gh release upload "$TAG" dist-zips/*.zip -R trilogy-group/electron --clobber
+          else
+            gh release create "$TAG" dist-zips/*.zip \
+              -R trilogy-group/electron \
+              --title "$TITLE" \
+              --notes "$NOTES" \
+              --target "${{ github.sha }}"
+          fi
+
+      - name: Build checksums.json
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import hashlib, json, pathlib
+          root = pathlib.Path("dist-zips")
+          checksums = {}
+          for path in sorted(root.glob("*.zip")):
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              checksums[path.name] = h.hexdigest()
+          pathlib.Path("checksums.json").write_text(json.dumps(checksums, indent=2) + "\n")
+          print(json.dumps(checksums, indent=2))
+          PY
+
+      - name: Prepare @trilogy-group/electron npm package
+        run: |
+          set -euo pipefail
+          mkdir -p npm-publish
+          cp -R electron/npm/. npm-publish/
+          cp checksums.json npm-publish/checksums.json
+
+          # Rewrite package.json for GitHub Packages + our mirror.
+          node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const version = process.env.ELECTRON_VERSION;
+          const mirror = process.env.TIMEBACK_ELECTRON_MIRROR;
+          const pkgPath = path.join('npm-publish', 'package.json');
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+          pkg.name = '@trilogy-group/electron';
+          pkg.version = version;
+          pkg.repository = {
+            type: 'git',
+            url: 'git+https://github.com/trilogy-group/electron.git'
+          };
+          pkg.publishConfig = {
+            registry: 'https://npm.pkg.github.com'
+          };
+          // Ensure install resolves binaries from our Releases even without ELECTRON_MIRROR.
+          pkg.config = {
+            ...(pkg.config || {}),
+            electron_mirror: mirror,
+            electron_custom_dir: `v${version}`
+          };
+          fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+
+          // Patch install.js to force our mirror (npm config is not always honored by @electron/get).
+          const installPath = path.join('npm-publish', 'install.js');
+          let install = fs.readFileSync(installPath, 'utf8');
+          if (!install.includes('TIMEBACK_MIRROR_INJECTED')) {
+            install = install.replace(
+              'downloadArtifact({',
+              `// TIMEBACK_MIRROR_INJECTED\nprocess.env.ELECTRON_MIRROR = process.env.ELECTRON_MIRROR || '${mirror}';\ndownloadArtifact({`
+            );
+            fs.writeFileSync(installPath, install);
+          }
+          console.log('Prepared', pkg.name, pkg.version);
+          NODE
+
+          # Need electron.d.ts from the repo for the package files list
+          if [ -f electron/electron.d.ts ]; then
+            cp electron/electron.d.ts npm-publish/electron.d.ts
+          elif [ -f electron/npm/electron.d.ts ]; then
+            cp electron/npm/electron.d.ts npm-publish/electron.d.ts
+          else
+            # Generated during full release; create a stub so pack does not fail if listed.
+            echo '// Types generated in official Electron releases; runtime package only.' > npm-publish/electron.d.ts
+          fi
+
+          # abi_version may be required by files list
+          if [ ! -f npm-publish/abi_version ] && [ -f electron/npm/abi_version ]; then
+            cp electron/npm/abi_version npm-publish/abi_version
+          elif [ ! -f npm-publish/abi_version ]; then
+            echo "0" > npm-publish/abi_version
+          fi
+
+          ls -la npm-publish
+
+      - name: Setup Node for GitHub Packages
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.x'
+          registry-url: https://npm.pkg.github.com
+          scope: '@trilogy-group'
+
+      - name: Publish @trilogy-group/electron
+        working-directory: npm-publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          npm publish --access restricted
+          echo "Published @trilogy-group/electron@${ELECTRON_VERSION}"
+          echo "Binaries: ${TIMEBACK_ELECTRON_MIRROR}v${ELECTRON_VERSION}/"
