@@ -4,6 +4,15 @@
 # Reuses machines only (macos-latest-xlarge / wseng-windows-latest-8vcpu).
 # Does NOT reuse Electron upstream publish pipelines or TimeBack app build-template.
 #
+# Caching (our own, since Electron's Azure src cache + RBE are maintainer-only):
+#   src-cache/<platform>/v2-src-cache-<depshash>.tar.zst  → synced Chromium tree
+#   sccache/                                              → compile object cache (opt-in)
+# Both live in s3://timeback-electron-src-cache (tbdev, 60-day lifecycle), reached
+# via OIDC role TimebackElectronCacheRole which is scoped to this repo + those prefixes.
+#
+# The src cache is uploaded immediately after a successful sync and BEFORE the compile,
+# so a failure hours into the build never costs us the sync again.
+#
 # Publish destinations:
 #   1) GitHub Releases  → https://github.com/trilogy-group/electron/releases
 #      (binaries consumed via ELECTRON_MIRROR / @electron/get)
@@ -31,11 +40,18 @@ on:
         description: 'Build Windows (x64 on wseng-windows-latest-8vcpu)'
         type: boolean
         default: true
+      use_src_cache:
+        description: 'Restore/save the Chromium src cache in S3'
+        type: boolean
+        default: true
+      use_sccache:
+        description: 'Also cache compile objects via sccache (unvalidated on official PGO builds)'
+        type: boolean
+        default: false
 
-permissions:
-  contents: write
-  packages: write
-  id-token: write
+# Least privilege: build jobs only read code and mint an OIDC token.
+# Release/npm write scopes are granted to the publish job alone.
+permissions: {}
 
 concurrency:
   group: timeback-electron-build-${{ github.ref }}
@@ -43,8 +59,12 @@ concurrency:
 
 env:
   ELECTRON_VERSION: ${{ inputs.version }}
+  ELECTRON_OUT_DIR: Release
   # Point @electron/get at this fork's Releases when publishing the npm package.
   TIMEBACK_ELECTRON_MIRROR: https://github.com/trilogy-group/electron/releases/download/
+  CACHE_BUCKET: ${{ vars.ELECTRON_CACHE_BUCKET }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_MAX_ATTEMPTS: '5'
 
 jobs:
   build-mac:
@@ -52,15 +72,30 @@ jobs:
     name: Build macOS arm64
     runs-on: macos-latest-xlarge
     timeout-minutes: 720
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TARGET_PLATFORM: macos
+      TARGET_ARCH: arm64
     steps:
-      - name: Checkout workflow helpers
+      - name: Create src dir
+        run: mkdir -p src
+
+      - name: Checkout Electron (patched branch)
         uses: actions/checkout@v4
         with:
-          path: workflow-repo
-          fetch-depth: 1
+          path: src/electron
+          fetch-depth: 0
+
+      - name: Show patch set under build
+        run: |
+          cd src/electron
+          echo "HEAD: $(git rev-parse --short HEAD)"
+          tail -n 8 patches/chromium/.patches
 
       - name: Free disk space (macOS)
-        uses: ./workflow-repo/.github/actions/free-space-macos
+        uses: ./src/electron/.github/actions/free-space-macos
 
       - name: Check disk
         run: df -h
@@ -70,69 +105,173 @@ jobs:
         with:
           node-version: '22.21.x'
 
-      - name: Install @electron/build-tools
-        run: |
-          npm i -g @electron/build-tools
-          e auto-update disable
-          e d auto-update disable
-          echo "$HOME/.electron_build_tools/third_party/depot_tools" >> "$GITHUB_PATH"
-          echo "$HOME/.electron_build_tools/third_party/depot_tools/python-bin" >> "$GITHUB_PATH"
+      - name: Ensure zstd
+        run: command -v zstd || brew install zstd
 
-      - name: Init Electron checkout (fork + release config)
+      - name: Install Dependencies
+        uses: ./src/electron/.github/actions/install-dependencies
+
+      - name: Install Build Tools
+        uses: ./src/electron/.github/actions/install-build-tools
+
+      - name: Generate DEPS hash
         run: |
           set -euo pipefail
-          ROOT="$HOME/electron-gn"
-          # e init requires an empty root — do not mkdir under $ROOT first.
-          e init timeback-mac \
-            --root="$ROOT" \
-            --fork=trilogy-group/electron \
+          node src/electron/script/generate-deps-hash.js
+          DEPSHASH="v2-src-cache-$(cat src/electron/.depshash)"
+          echo "DEPSHASH=$DEPSHASH" >> "$GITHUB_ENV"
+          echo "CACHE_KEY=src-cache/${TARGET_PLATFORM}/${DEPSHASH}.tar.zst" >> "$GITHUB_ENV"
+          echo "CACHE_FILE=${DEPSHASH}.tar.zst" >> "$GITHUB_ENV"
+          echo "Cache key: src-cache/${TARGET_PLATFORM}/${DEPSHASH}.tar.zst"
+
+      - name: Configure AWS credentials from OIDC
+        if: ${{ inputs.use_src_cache || inputs.use_sccache }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_ROLE_NAME }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-duration-seconds: 43200
+
+      - name: Check src cache
+        id: src-cache
+        run: |
+          set -uo pipefail
+          if [ "${{ inputs.use_src_cache }}" != "true" ]; then
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+            echo "Src cache disabled for this run"
+            exit 0
+          fi
+          if aws s3api head-object --bucket "$CACHE_BUCKET" --key "$CACHE_KEY" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "Cache HIT for $CACHE_KEY"
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+            echo "Cache MISS for $CACHE_KEY"
+          fi
+
+      - name: Init build config
+        run: |
+          set -euo pipefail
+          # -f allows a non-empty root (src/electron is already checked out).
+          e init -f timeback-mac \
+            --root="$(pwd)" \
+            --out=Release \
             -i release \
             --remote-build none \
             --use-https
 
-          # Pre-seed src/electron with this workflow commit (patched branch, all five fixes).
-          # gclient treats electron as unmanaged, so e sync will use this DEPS tree.
-          mkdir -p "$ROOT/src"
-          git clone --filter=blob:none --no-checkout \
-            "https://github.com/trilogy-group/electron.git" \
-            "$ROOT/src/electron"
-          cd "$ROOT/src/electron"
-          git fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --force FETCH_HEAD
-          echo "Electron HEAD: $(git rev-parse --short HEAD)"
-          echo "Branch tip patches:"
-          tail -n 8 patches/chromium/.patches
+      # --- Cache HIT path: restore the synced tree, then run Electron-only hooks ---
+      - name: Restore src cache
+        if: steps.src-cache.outputs.hit == 'true'
+        run: |
+          set -euo pipefail
+          aws s3 cp "s3://$CACHE_BUCKET/$CACHE_KEY" "$CACHE_FILE"
+          echo "Downloaded $(du -sh "$CACHE_FILE" | cut -f1)"
+          # The tarball deliberately excludes src/electron, so our checkout survives.
+          zstd -d --long=30 -c "$CACHE_FILE" | tar -xf - -C .
+          rm -f "$CACHE_FILE"
+          test -d src/third_party/blink || { echo "Cache restore incomplete"; exit 1; }
+          echo "Restored src: $(du -sh src | cut -f1)"
 
+      - name: Run Electron-only hooks (cache hit)
+        if: steps.src-cache.outputs.hit == 'true'
+        run: |
+          e d gclient runhooks --spec="solutions=[{'name':'src/electron','url':None,'deps_file':'DEPS','custom_vars':{'process_deps':False},'managed':False}]"
+
+      # Release builds need Electron's PGO profiles. The hooks above run with
+      # process_deps=False, which skips the gclient hook that downloads them.
+      - name: Download PGO profiles (cache hit)
+        if: steps.src-cache.outputs.hit == 'true'
+        run: |
+          python3 src/electron/script/pgo/download-profiles.py \
+            --targets "${TARGET_PLATFORM}-${TARGET_ARCH},v8-builtins"
+
+      # --- Cache MISS path: full sync, then persist the tree before compiling ---
       - name: Sync (gclient + apply Chromium patches)
+        if: steps.src-cache.outputs.hit != 'true'
         run: e sync -f
         env:
-          DEPOT_TOOLS_UPDATE: 0
+          DEPOT_TOOLS_UPDATE: '0'
+
+      - name: Save src cache
+        if: ${{ steps.src-cache.outputs.hit != 'true' && inputs.use_src_cache }}
+        run: |
+          set -euo pipefail
+          # Mirror upstream's cache shape: drop .git dirs (except angle/dawn, whose
+          # HEAD files feed generated headers) and the heaviest unused test data.
+          find src -type d -name .git \
+            -not -path 'src/third_party/angle/*' \
+            -not -path 'src/third_party/dawn/*' \
+            -not -path 'src/electron/*' > /tmp/cache-excludes
+          cat >> /tmp/cache-excludes <<'EOF'
+          src/electron
+          src/android_webview
+          src/ios/chrome
+          src/third_party/blink/perf_tests
+          src/chrome/test/data/xr/webvr_info
+          src/third_party/angle/third_party/VK-GL-CTS/src
+          src/third_party/swift-toolchain
+          src/third_party/swiftshader/tests/regres/testlists
+          EOF
+          echo "Uncompressed src: $(du -sh src | cut -f1)"
+          tar -cf - --exclude-from=/tmp/cache-excludes src \
+            | zstd -T0 --long=30 -f -o "$CACHE_FILE"
+          echo "Compressed: $(du -sh "$CACHE_FILE" | cut -f1)"
+          # Upload to a run-unique temp key first so a concurrent reader never sees
+          # a partial object, then promote it.
+          TMP_KEY="${CACHE_KEY}.upload-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          aws s3 cp "$CACHE_FILE" "s3://$CACHE_BUCKET/$TMP_KEY"
+          if aws s3api head-object --bucket "$CACHE_BUCKET" --key "$CACHE_KEY" >/dev/null 2>&1; then
+            echo "Another run already published this key; discarding ours"
+            aws s3 rm "s3://$CACHE_BUCKET/$TMP_KEY"
+          else
+            aws s3 mv "s3://$CACHE_BUCKET/$TMP_KEY" "s3://$CACHE_BUCKET/$CACHE_KEY"
+            echo "Persisted $CACHE_KEY"
+          fi
+          rm -f "$CACHE_FILE"
+
+      # --- Compile ---
+      - name: Setup sccache
+        if: ${{ inputs.use_sccache }}
+        run: |
+          set -euo pipefail
+          command -v sccache || brew install sccache
+          echo "SCCACHE_BUCKET=$CACHE_BUCKET" >> "$GITHUB_ENV"
+          echo "SCCACHE_REGION=$AWS_REGION" >> "$GITHUB_ENV"
+          echo "SCCACHE_S3_KEY_PREFIX=sccache/${TARGET_PLATFORM}-${TARGET_ARCH}" >> "$GITHUB_ENV"
+          echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
+          echo "GN_CC_WRAPPER=$(command -v sccache)" >> "$GITHUB_ENV"
+          sccache --start-server
+          sccache --show-stats
+
+      - name: Add CHROMIUM_BUILDTOOLS_PATH to env
+        run: echo "CHROMIUM_BUILDTOOLS_PATH=$(pwd)/src/buildtools" >> "$GITHUB_ENV"
 
       - name: Build Electron (release)
         run: |
-          # override_electron_version so zip/npm version is 43.2.0-timeback.1 (not upstream tag)
-          CI=1 GN_EXTRA_ARGS="override_electron_version=\"${ELECTRON_VERSION}\"" e build --no-remote
+          set -euo pipefail
+          # override_electron_version so the zip/npm version is ours, not the upstream tag.
+          EXTRA="override_electron_version=\"${ELECTRON_VERSION}\""
+          if [ -n "${GN_CC_WRAPPER:-}" ]; then
+            EXTRA="$EXTRA cc_wrapper=\"${GN_CC_WRAPPER}\""
+          fi
+          CI=1 GN_EXTRA_ARGS="$EXTRA" e build --no-remote
+
+      - name: sccache stats
+        if: ${{ always() && inputs.use_sccache }}
+        run: sccache --show-stats || true
 
       - name: Package dist.zip
         run: |
           set -euo pipefail
-          ROOT="$HOME/electron-gn"
-          OUT="$ROOT/src/out/Release"
-          if [ ! -d "$OUT" ]; then
-            OUT="$ROOT/src/out/Default"
-          fi
+          OUT="src/out/Release"
+          test -d "$OUT" || OUT="src/out/Default"
           echo "OUT=$OUT"
           ninja -C "$OUT" electron:electron_dist_zip
-          ARCH="$(uname -m)"
-          case "$ARCH" in
-            arm64) PLATFORM_ARCH=arm64 ;;
-            x86_64) PLATFORM_ARCH=x64 ;;
-            *) PLATFORM_ARCH="$ARCH" ;;
-          esac
-          ARTIFACT="electron-v${ELECTRON_VERSION}-darwin-${PLATFORM_ARCH}.zip"
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          cp "$OUT/dist.zip" "$GITHUB_WORKSPACE/artifacts/$ARTIFACT"
-          ls -lh "$GITHUB_WORKSPACE/artifacts"
+          ARTIFACT="electron-v${ELECTRON_VERSION}-darwin-${TARGET_ARCH}.zip"
+          mkdir -p artifacts
+          cp "$OUT/dist.zip" "artifacts/$ARTIFACT"
+          ls -lh artifacts
 
       - name: Upload mac artifact
         uses: actions/upload-artifact@v4
@@ -147,29 +286,16 @@ jobs:
     name: Build Windows x64
     runs-on: wseng-windows-latest-8vcpu
     timeout-minutes: 720
+    permissions:
+      contents: read
+      id-token: write
     defaults:
       run:
         shell: bash
+    env:
+      TARGET_PLATFORM: win
+      TARGET_ARCH: x64
     steps:
-      - name: Checkout workflow helpers
-        uses: actions/checkout@v4
-        with:
-          path: workflow-repo
-          fetch-depth: 1
-
-      - name: Check disk / toolchain
-        run: |
-          df -h || true
-          echo "VS installs:"
-          ls "/c/Program Files/Microsoft Visual Studio" 2>/dev/null || ls "/c/Program Files (x86)/Microsoft Visual Studio" 2>/dev/null || echo "No Visual Studio found"
-          which cl || true
-          python3 --version || python --version
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22.21.x'
-
       - name: Configure git for Windows Chromium
         run: |
           git config --global core.filemode false
@@ -178,58 +304,190 @@ jobs:
           git config --global core.fscache true
           git config --global core.preloadindex true
 
-      - name: Install @electron/build-tools
-        run: |
-          npm i -g @electron/build-tools
-          e auto-update disable
-          e d auto-update disable
-          echo "$HOME/.electron_build_tools/third_party/depot_tools" >> "$GITHUB_PATH"
-          echo "$HOME/.electron_build_tools/third_party/depot_tools/python-bin" >> "$GITHUB_PATH"
+      - name: Create src dir
+        run: mkdir -p src
 
-      - name: Init Electron checkout (fork + release config)
+      - name: Checkout Electron (patched branch)
+        uses: actions/checkout@v4
+        with:
+          path: src/electron
+          fetch-depth: 0
+
+      - name: Show patch set under build
+        run: |
+          cd src/electron
+          echo "HEAD: $(git rev-parse --short HEAD)"
+          tail -n 8 patches/chromium/.patches
+
+      - name: Check disk / toolchain
+        run: |
+          df -h || true
+          echo "VS installs:"
+          ls "/c/Program Files/Microsoft Visual Studio" 2>/dev/null \
+            || ls "/c/Program Files (x86)/Microsoft Visual Studio" 2>/dev/null \
+            || echo "No Visual Studio found"
+          python3 --version || python --version
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.x'
+
+      - name: Ensure zstd and AWS CLI
         run: |
           set -euo pipefail
-          ROOT="$HOME/electron-gn"
-          # e init requires an empty root — do not mkdir under $ROOT first.
-          e init timeback-win \
-            --root="$ROOT" \
-            --fork=trilogy-group/electron \
+          command -v zstd || choco install zstd -y --no-progress
+          command -v aws || choco install awscli -y --no-progress
+          command -v zstd && zstd --version
+          command -v aws && aws --version
+
+      - name: Install Dependencies
+        uses: ./src/electron/.github/actions/install-dependencies
+
+      - name: Install Build Tools
+        uses: ./src/electron/.github/actions/install-build-tools
+
+      - name: Generate DEPS hash
+        run: |
+          set -euo pipefail
+          node src/electron/script/generate-deps-hash.js
+          DEPSHASH="v2-src-cache-$(cat src/electron/.depshash)"
+          echo "DEPSHASH=$DEPSHASH" >> "$GITHUB_ENV"
+          echo "CACHE_KEY=src-cache/${TARGET_PLATFORM}/${DEPSHASH}.tar.zst" >> "$GITHUB_ENV"
+          echo "CACHE_FILE=${DEPSHASH}.tar.zst" >> "$GITHUB_ENV"
+          echo "Cache key: src-cache/${TARGET_PLATFORM}/${DEPSHASH}.tar.zst"
+
+      - name: Configure AWS credentials from OIDC
+        if: ${{ inputs.use_src_cache || inputs.use_sccache }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_ROLE_NAME }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-duration-seconds: 43200
+
+      - name: Check src cache
+        id: src-cache
+        run: |
+          set -uo pipefail
+          if [ "${{ inputs.use_src_cache }}" != "true" ]; then
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+            echo "Src cache disabled for this run"
+            exit 0
+          fi
+          if aws s3api head-object --bucket "$CACHE_BUCKET" --key "$CACHE_KEY" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "Cache HIT for $CACHE_KEY"
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+            echo "Cache MISS for $CACHE_KEY"
+          fi
+
+      - name: Init build config
+        run: |
+          set -euo pipefail
+          e init -f timeback-win \
+            --root="$(pwd)" \
+            --out=Release \
             -i release \
             --remote-build none \
             --use-https
 
-          mkdir -p "$ROOT/src"
-          git clone --filter=blob:none --no-checkout \
-            "https://github.com/trilogy-group/electron.git" \
-            "$ROOT/src/electron"
-          cd "$ROOT/src/electron"
-          git fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --force FETCH_HEAD
-          echo "Electron HEAD: $(git rev-parse --short HEAD)"
-          tail -n 8 patches/chromium/.patches
+      - name: Restore src cache
+        if: steps.src-cache.outputs.hit == 'true'
+        run: |
+          set -euo pipefail
+          aws s3 cp "s3://$CACHE_BUCKET/$CACHE_KEY" "$CACHE_FILE"
+          zstd -d --long=30 -c "$CACHE_FILE" | tar -xf - -C .
+          rm -f "$CACHE_FILE"
+          test -d src/third_party/blink || { echo "Cache restore incomplete"; exit 1; }
+
+      - name: Run Electron-only hooks (cache hit)
+        if: steps.src-cache.outputs.hit == 'true'
+        run: |
+          e d gclient runhooks --spec="solutions=[{'name':'src/electron','url':None,'deps_file':'DEPS','custom_vars':{'process_deps':False},'managed':False}]"
+
+      - name: Download PGO profiles (cache hit)
+        if: steps.src-cache.outputs.hit == 'true'
+        run: |
+          python3 src/electron/script/pgo/download-profiles.py \
+            --targets "${TARGET_PLATFORM}-${TARGET_ARCH},v8-builtins"
 
       - name: Sync (gclient + apply Chromium patches)
+        if: steps.src-cache.outputs.hit != 'true'
         run: e sync -f
         env:
-          DEPOT_TOOLS_UPDATE: 0
+          DEPOT_TOOLS_UPDATE: '0'
+
+      - name: Save src cache
+        if: ${{ steps.src-cache.outputs.hit != 'true' && inputs.use_src_cache }}
+        run: |
+          set -euo pipefail
+          find src -type d -name .git \
+            -not -path 'src/third_party/angle/*' \
+            -not -path 'src/third_party/dawn/*' \
+            -not -path 'src/electron/*' > /tmp/cache-excludes
+          cat >> /tmp/cache-excludes <<'EOF'
+          src/electron
+          src/android_webview
+          src/ios/chrome
+          src/third_party/blink/perf_tests
+          src/chrome/test/data/xr/webvr_info
+          src/third_party/angle/third_party/VK-GL-CTS/src
+          src/third_party/swift-toolchain
+          src/third_party/swiftshader/tests/regres/testlists
+          EOF
+          tar -cf - --exclude-from=/tmp/cache-excludes src \
+            | zstd -T0 --long=30 -f -o "$CACHE_FILE"
+          echo "Compressed: $(du -sh "$CACHE_FILE" | cut -f1)"
+          TMP_KEY="${CACHE_KEY}.upload-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          aws s3 cp "$CACHE_FILE" "s3://$CACHE_BUCKET/$TMP_KEY"
+          if aws s3api head-object --bucket "$CACHE_BUCKET" --key "$CACHE_KEY" >/dev/null 2>&1; then
+            aws s3 rm "s3://$CACHE_BUCKET/$TMP_KEY"
+          else
+            aws s3 mv "s3://$CACHE_BUCKET/$TMP_KEY" "s3://$CACHE_BUCKET/$CACHE_KEY"
+            echo "Persisted $CACHE_KEY"
+          fi
+          rm -f "$CACHE_FILE"
+
+      - name: Setup sccache
+        if: ${{ inputs.use_sccache }}
+        run: |
+          set -euo pipefail
+          command -v sccache || choco install sccache -y --no-progress
+          echo "SCCACHE_BUCKET=$CACHE_BUCKET" >> "$GITHUB_ENV"
+          echo "SCCACHE_REGION=$AWS_REGION" >> "$GITHUB_ENV"
+          echo "SCCACHE_S3_KEY_PREFIX=sccache/${TARGET_PLATFORM}-${TARGET_ARCH}" >> "$GITHUB_ENV"
+          echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
+          echo "GN_CC_WRAPPER=$(command -v sccache)" >> "$GITHUB_ENV"
+          sccache --start-server
+          sccache --show-stats
+
+      - name: Add CHROMIUM_BUILDTOOLS_PATH to env
+        run: echo "CHROMIUM_BUILDTOOLS_PATH=$(pwd)/src/buildtools" >> "$GITHUB_ENV"
 
       - name: Build Electron (release)
         run: |
-          CI=1 GN_EXTRA_ARGS="override_electron_version=\"${ELECTRON_VERSION}\"" e build --no-remote
+          set -euo pipefail
+          EXTRA="override_electron_version=\"${ELECTRON_VERSION}\""
+          if [ -n "${GN_CC_WRAPPER:-}" ]; then
+            EXTRA="$EXTRA cc_wrapper=\"${GN_CC_WRAPPER}\""
+          fi
+          CI=1 GN_EXTRA_ARGS="$EXTRA" e build --no-remote
+
+      - name: sccache stats
+        if: ${{ always() && inputs.use_sccache }}
+        run: sccache --show-stats || true
 
       - name: Package dist.zip
         run: |
           set -euo pipefail
-          ROOT="$HOME/electron-gn"
-          OUT="$ROOT/src/out/Release"
-          if [ ! -d "$OUT" ]; then
-            OUT="$ROOT/src/out/Default"
-          fi
+          OUT="src/out/Release"
+          test -d "$OUT" || OUT="src/out/Default"
           ninja -C "$OUT" electron:electron_dist_zip
-          ARTIFACT="electron-v${ELECTRON_VERSION}-win32-x64.zip"
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          cp "$OUT/dist.zip" "$GITHUB_WORKSPACE/artifacts/$ARTIFACT"
-          ls -lh "$GITHUB_WORKSPACE/artifacts"
+          ARTIFACT="electron-v${ELECTRON_VERSION}-win32-${TARGET_ARCH}.zip"
+          mkdir -p artifacts
+          cp "$OUT/dist.zip" "artifacts/$ARTIFACT"
+          ls -lh artifacts
 
       - name: Upload win artifact
         uses: actions/upload-artifact@v4
@@ -244,6 +502,9 @@ jobs:
     needs: [build-mac, build-win]
     if: ${{ always() && inputs.publish && (needs.build-mac.result == 'success' || needs.build-win.result == 'success') }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
     steps:
       - name: Checkout npm package sources
         uses: actions/checkout@v4
