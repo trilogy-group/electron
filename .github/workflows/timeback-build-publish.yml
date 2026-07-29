@@ -6,12 +6,16 @@
 #
 # Caching (our own, since Electron's Azure src cache + RBE are maintainer-only):
 #   src-cache/<platform>/v2-src-cache-<depshash>.tar.zst  → synced Chromium tree
+#   out-cache/<platform>-<arch>/<depshash>/                → mirrored out/Release
 #   sccache/                                              → compile object cache (opt-in)
 # Both live in s3://timeback-electron-src-cache (tbdev, 60-day lifecycle), reached
 # via OIDC role TimebackElectronCacheRole which is scoped to this repo + those prefixes.
 #
 # The src cache is uploaded immediately after a successful sync and BEFORE the compile,
-# so a failure hours into the build never costs us the sync again.
+# so a failure hours into the build never costs us the sync again. The compile itself
+# runs in timed passes (see script/timeback/build-resumable.sh) that checkpoint
+# out/Release to S3 in between, so dying at ninja target 41k of 42k replays only the
+# last pass instead of the whole build.
 #
 # Publish destinations:
 #   1) GitHub Releases  → https://github.com/trilogy-group/electron/releases
@@ -44,6 +48,13 @@ on:
         description: 'Restore/save the Chromium src cache in S3'
         type: boolean
         default: true
+      use_out_cache:
+        description: 'Checkpoint out/Release to S3 so a failed/timed-out compile resumes'
+        type: boolean
+        default: true
+      snapshot_interval_seconds:
+        description: 'Seconds of compiling between out/Release checkpoints'
+        default: '4500'
       use_sccache:
         description: 'Also cache compile objects via sccache (unvalidated on official PGO builds)'
         type: boolean
@@ -65,6 +76,9 @@ env:
   CACHE_BUCKET: ${{ vars.ELECTRON_CACHE_BUCKET }}
   AWS_REGION: ${{ vars.AWS_REGION }}
   AWS_MAX_ATTEMPTS: '5'
+  OUT_DIR: src/out/Release
+  USE_OUT_CACHE: ${{ inputs.use_out_cache }}
+  SNAPSHOT_INTERVAL_SECONDS: ${{ inputs.snapshot_interval_seconds }}
 
 jobs:
   build-mac:
@@ -121,11 +135,11 @@ jobs:
           DEPSHASH="v2-src-cache-$(cat src/electron/.depshash)"
           echo "DEPSHASH=$DEPSHASH" >> "$GITHUB_ENV"
           echo "CACHE_KEY=src-cache/${TARGET_PLATFORM}/${DEPSHASH}.tar.zst" >> "$GITHUB_ENV"
-          echo "CACHE_FILE=${DEPSHASH}.tar.zst" >> "$GITHUB_ENV"
+          echo "OUT_CACHE_PREFIX=out-cache/${TARGET_PLATFORM}-${TARGET_ARCH}/${DEPSHASH}/" >> "$GITHUB_ENV"
           echo "Cache key: src-cache/${TARGET_PLATFORM}/${DEPSHASH}.tar.zst"
 
       - name: Configure AWS credentials from OIDC
-        if: ${{ inputs.use_src_cache || inputs.use_sccache }}
+        if: ${{ inputs.use_src_cache || inputs.use_out_cache || inputs.use_sccache }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_ROLE_NAME }}
@@ -165,11 +179,9 @@ jobs:
         if: steps.src-cache.outputs.hit == 'true'
         run: |
           set -euo pipefail
-          aws s3 cp "s3://$CACHE_BUCKET/$CACHE_KEY" "$CACHE_FILE"
-          echo "Downloaded $(du -sh "$CACHE_FILE" | cut -f1)"
-          # The tarball deliberately excludes src/electron, so our checkout survives.
-          zstd -d --long=30 -c "$CACHE_FILE" | tar -xf - -C .
-          rm -f "$CACHE_FILE"
+          # Streamed straight into tar; the tarball deliberately excludes
+          # src/electron, so our checkout survives.
+          aws s3 cp "s3://$CACHE_BUCKET/$CACHE_KEY" - | zstd -d --long=30 -c | tar -xf - -C .
           test -d src/third_party/blink || { echo "Cache restore incomplete"; exit 1; }
           echo "Restored src: $(du -sh src | cut -f1)"
 
@@ -213,14 +225,15 @@ jobs:
           src/third_party/swift-toolchain
           src/third_party/swiftshader/tests/regres/testlists
           EOF
-          echo "Uncompressed src: $(du -sh src | cut -f1)"
-          tar -cf - --exclude-from=/tmp/cache-excludes src \
-            | zstd -T0 --long=30 -f -o "$CACHE_FILE"
-          echo "Compressed: $(du -sh "$CACHE_FILE" | cut -f1)"
+          SRC_KB=$(du -sk src | cut -f1)
+          echo "Uncompressed src: $(( SRC_KB / 1024 )) MiB"
           # Upload to a run-unique temp key first so a concurrent reader never sees
-          # a partial object, then promote it.
+          # a partial object, then promote it. Streamed, so the tarball itself never
+          # needs disk next to the checkout.
           TMP_KEY="${CACHE_KEY}.upload-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          aws s3 cp "$CACHE_FILE" "s3://$CACHE_BUCKET/$TMP_KEY"
+          tar -cf - --exclude-from=/tmp/cache-excludes src \
+            | zstd -T0 --long=30 -c \
+            | aws s3 cp - "s3://$CACHE_BUCKET/$TMP_KEY" --expected-size "$(( SRC_KB * 1024 ))"
           if aws s3api head-object --bucket "$CACHE_BUCKET" --key "$CACHE_KEY" >/dev/null 2>&1; then
             echo "Another run already published this key; discarding ours"
             aws s3 rm "s3://$CACHE_BUCKET/$TMP_KEY"
@@ -228,7 +241,6 @@ jobs:
             aws s3 mv "s3://$CACHE_BUCKET/$TMP_KEY" "s3://$CACHE_BUCKET/$CACHE_KEY"
             echo "Persisted $CACHE_KEY"
           fi
-          rm -f "$CACHE_FILE"
 
       # --- Compile ---
       - name: Setup sccache
@@ -247,15 +259,17 @@ jobs:
       - name: Add CHROMIUM_BUILDTOOLS_PATH to env
         run: echo "CHROMIUM_BUILDTOOLS_PATH=$(pwd)/src/buildtools" >> "$GITHUB_ENV"
 
-      - name: Build Electron (release)
-        run: |
-          set -euo pipefail
-          # override_electron_version so the zip/npm version is ours, not the upstream tag.
-          EXTRA="override_electron_version=\"${ELECTRON_VERSION}\""
-          if [ -n "${GN_CC_WRAPPER:-}" ]; then
-            EXTRA="$EXTRA cc_wrapper=\"${GN_CC_WRAPPER}\""
-          fi
-          CI=1 GN_EXTRA_ARGS="$EXTRA" e build --no-remote
+      # Restores the last out/Release checkpoint, then compiles in timed passes,
+      # uploading a new checkpoint between each one and on failure.
+      - name: Build Electron (release, resumable)
+        id: build
+        run: bash src/electron/script/timeback/build-resumable.sh
+
+      # The script checkpoints its own failures; this covers a cancel or a job
+      # timeout, where it never gets to return.
+      - name: Checkpoint out dir (cancelled)
+        if: ${{ cancelled() && inputs.use_out_cache }}
+        run: bash src/electron/script/timeback/out-cache.sh save
 
       - name: sccache stats
         if: ${{ always() && inputs.use_sccache }}
@@ -264,7 +278,7 @@ jobs:
       - name: Package dist.zip
         run: |
           set -euo pipefail
-          OUT="src/out/Release"
+          OUT="$OUT_DIR"
           test -d "$OUT" || OUT="src/out/Default"
           echo "OUT=$OUT"
           ninja -C "$OUT" electron:electron_dist_zip
@@ -354,11 +368,11 @@ jobs:
           DEPSHASH="v2-src-cache-$(cat src/electron/.depshash)"
           echo "DEPSHASH=$DEPSHASH" >> "$GITHUB_ENV"
           echo "CACHE_KEY=src-cache/${TARGET_PLATFORM}/${DEPSHASH}.tar.zst" >> "$GITHUB_ENV"
-          echo "CACHE_FILE=${DEPSHASH}.tar.zst" >> "$GITHUB_ENV"
+          echo "OUT_CACHE_PREFIX=out-cache/${TARGET_PLATFORM}-${TARGET_ARCH}/${DEPSHASH}/" >> "$GITHUB_ENV"
           echo "Cache key: src-cache/${TARGET_PLATFORM}/${DEPSHASH}.tar.zst"
 
       - name: Configure AWS credentials from OIDC
-        if: ${{ inputs.use_src_cache || inputs.use_sccache }}
+        if: ${{ inputs.use_src_cache || inputs.use_out_cache || inputs.use_sccache }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_ROLE_NAME }}
@@ -396,9 +410,7 @@ jobs:
         if: steps.src-cache.outputs.hit == 'true'
         run: |
           set -euo pipefail
-          aws s3 cp "s3://$CACHE_BUCKET/$CACHE_KEY" "$CACHE_FILE"
-          zstd -d --long=30 -c "$CACHE_FILE" | tar -xf - -C .
-          rm -f "$CACHE_FILE"
+          aws s3 cp "s3://$CACHE_BUCKET/$CACHE_KEY" - | zstd -d --long=30 -c | tar -xf - -C .
           test -d src/third_party/blink || { echo "Cache restore incomplete"; exit 1; }
 
       - name: Run Electron-only hooks (cache hit)
@@ -436,18 +448,17 @@ jobs:
           src/third_party/swift-toolchain
           src/third_party/swiftshader/tests/regres/testlists
           EOF
-          tar -cf - --exclude-from=/tmp/cache-excludes src \
-            | zstd -T0 --long=30 -f -o "$CACHE_FILE"
-          echo "Compressed: $(du -sh "$CACHE_FILE" | cut -f1)"
+          SRC_KB=$(du -sk src | cut -f1)
           TMP_KEY="${CACHE_KEY}.upload-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          aws s3 cp "$CACHE_FILE" "s3://$CACHE_BUCKET/$TMP_KEY"
+          tar -cf - --exclude-from=/tmp/cache-excludes src \
+            | zstd -T0 --long=30 -c \
+            | aws s3 cp - "s3://$CACHE_BUCKET/$TMP_KEY" --expected-size "$(( SRC_KB * 1024 ))"
           if aws s3api head-object --bucket "$CACHE_BUCKET" --key "$CACHE_KEY" >/dev/null 2>&1; then
             aws s3 rm "s3://$CACHE_BUCKET/$TMP_KEY"
           else
             aws s3 mv "s3://$CACHE_BUCKET/$TMP_KEY" "s3://$CACHE_BUCKET/$CACHE_KEY"
             echo "Persisted $CACHE_KEY"
           fi
-          rm -f "$CACHE_FILE"
 
       - name: Setup sccache
         if: ${{ inputs.use_sccache }}
@@ -465,14 +476,13 @@ jobs:
       - name: Add CHROMIUM_BUILDTOOLS_PATH to env
         run: echo "CHROMIUM_BUILDTOOLS_PATH=$(pwd)/src/buildtools" >> "$GITHUB_ENV"
 
-      - name: Build Electron (release)
-        run: |
-          set -euo pipefail
-          EXTRA="override_electron_version=\"${ELECTRON_VERSION}\""
-          if [ -n "${GN_CC_WRAPPER:-}" ]; then
-            EXTRA="$EXTRA cc_wrapper=\"${GN_CC_WRAPPER}\""
-          fi
-          CI=1 GN_EXTRA_ARGS="$EXTRA" e build --no-remote
+      - name: Build Electron (release, resumable)
+        id: build
+        run: bash src/electron/script/timeback/build-resumable.sh
+
+      - name: Checkpoint out dir (cancelled)
+        if: ${{ cancelled() && inputs.use_out_cache }}
+        run: bash src/electron/script/timeback/out-cache.sh save
 
       - name: sccache stats
         if: ${{ always() && inputs.use_sccache }}
@@ -481,7 +491,7 @@ jobs:
       - name: Package dist.zip
         run: |
           set -euo pipefail
-          OUT="src/out/Release"
+          OUT="$OUT_DIR"
           test -d "$OUT" || OUT="src/out/Default"
           ninja -C "$OUT" electron:electron_dist_zip
           ARTIFACT="electron-v${ELECTRON_VERSION}-win32-${TARGET_ARCH}.zip"
