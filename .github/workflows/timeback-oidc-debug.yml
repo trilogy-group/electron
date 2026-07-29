@@ -28,3 +28,19 @@ jobs:
           for key in ('iss', 'aud', 'sub', 'repository', 'repository_owner', 'ref'):
               print(f"{key} = {claims.get(key)}")
           PY
+
+      - name: Assume the cache role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_ROLE_NAME }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-duration-seconds: 43200
+
+      - name: Prove bucket access
+        run: |
+          set -euo pipefail
+          aws sts get-caller-identity
+          aws s3 ls "s3://${{ vars.ELECTRON_CACHE_BUCKET }}/" || true
+          echo "ok" | aws s3 cp - "s3://${{ vars.ELECTRON_CACHE_BUCKET }}/out-cache/oidc-probe/ok.txt"
+          aws s3 rm "s3://${{ vars.ELECTRON_CACHE_BUCKET }}/out-cache/oidc-probe/ok.txt"
+          echo "read+write to the cache prefixes confirmed"
