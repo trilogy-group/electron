@@ -82,8 +82,7 @@ jobs:
         run: |
           set -euo pipefail
           ROOT="$HOME/electron-gn"
-          mkdir -p "$ROOT/src"
-          # e init only writes build-tools config + gclient config — it does NOT clone.
+          # e init requires an empty root — do not mkdir under $ROOT first.
           e init timeback-mac \
             --root="$ROOT" \
             --fork=trilogy-group/electron \
@@ -91,8 +90,9 @@ jobs:
             --remote-build none \
             --use-https
 
-          # Pre-seed src/electron with this workflow commit (patched v43.2.0 branch).
+          # Pre-seed src/electron with this workflow commit (patched branch, all five fixes).
           # gclient treats electron as unmanaged, so e sync will use this DEPS tree.
+          mkdir -p "$ROOT/src"
           git clone --filter=blob:none --no-checkout \
             "https://github.com/trilogy-group/electron.git" \
             "$ROOT/src/electron"
@@ -190,7 +190,7 @@ jobs:
         run: |
           set -euo pipefail
           ROOT="$HOME/electron-gn"
-          mkdir -p "$ROOT/src"
+          # e init requires an empty root — do not mkdir under $ROOT first.
           e init timeback-win \
             --root="$ROOT" \
             --fork=trilogy-group/electron \
@@ -198,6 +198,7 @@ jobs:
             --remote-build none \
             --use-https
 
+          mkdir -p "$ROOT/src"
           git clone --filter=blob:none --no-checkout \
             "https://github.com/trilogy-group/electron.git" \
             "$ROOT/src/electron"
