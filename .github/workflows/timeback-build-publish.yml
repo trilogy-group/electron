@@ -82,8 +82,8 @@ jobs:
         run: |
           set -euo pipefail
           ROOT="$HOME/electron-gn"
-          mkdir -p "$ROOT"
-          # -i release → out/Release; --remote-build none → no Electron RBE
+          mkdir -p "$ROOT/src"
+          # e init only writes build-tools config + gclient config — it does NOT clone.
           e init timeback-mac \
             --root="$ROOT" \
             --fork=trilogy-group/electron \
@@ -91,12 +91,14 @@ jobs:
             --remote-build none \
             --use-https
 
+          # Pre-seed src/electron with this workflow commit (patched v43.2.0 branch).
+          # gclient treats electron as unmanaged, so e sync will use this DEPS tree.
+          git clone --filter=blob:none --no-checkout \
+            "https://github.com/trilogy-group/electron.git" \
+            "$ROOT/src/electron"
           cd "$ROOT/src/electron"
-          # e init checks out upstream main; switch to this workflow's commit (patched branch).
-          git remote add timeback "https://github.com/trilogy-group/electron.git" 2>/dev/null || true
-          git fetch --depth=1 timeback "${{ github.sha }}"
+          git fetch --depth=1 origin "${{ github.sha }}"
           git checkout --force FETCH_HEAD
-          git clean -fdx
           echo "Electron HEAD: $(git rev-parse --short HEAD)"
           echo "Branch tip patches:"
           tail -n 8 patches/chromium/.patches
@@ -188,7 +190,7 @@ jobs:
         run: |
           set -euo pipefail
           ROOT="$HOME/electron-gn"
-          mkdir -p "$ROOT"
+          mkdir -p "$ROOT/src"
           e init timeback-win \
             --root="$ROOT" \
             --fork=trilogy-group/electron \
@@ -196,11 +198,12 @@ jobs:
             --remote-build none \
             --use-https
 
+          git clone --filter=blob:none --no-checkout \
+            "https://github.com/trilogy-group/electron.git" \
+            "$ROOT/src/electron"
           cd "$ROOT/src/electron"
-          git remote add timeback "https://github.com/trilogy-group/electron.git" 2>/dev/null || true
-          git fetch --depth=1 timeback "${{ github.sha }}"
+          git fetch --depth=1 origin "${{ github.sha }}"
           git checkout --force FETCH_HEAD
-          git clean -fdx
           echo "Electron HEAD: $(git rev-parse --short HEAD)"
           tail -n 8 patches/chromium/.patches
 
