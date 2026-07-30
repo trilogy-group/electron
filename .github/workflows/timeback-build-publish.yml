@@ -95,6 +95,20 @@ jobs:
       TARGET_PLATFORM: macos
       TARGET_ARCH: arm64
     steps:
+      # Build times are only comparable across runs if we know what we ran on,
+      # and the Xcode SDK version decides whether a restored out dir is reusable.
+      - name: Runner specs
+        run: |
+          echo "runner:    $RUNNER_NAME ($RUNNER_OS/$RUNNER_ARCH)"
+          echo "cpu:       $(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
+          echo "cores:     $(sysctl -n hw.ncpu) logical, $(sysctl -n hw.physicalcpu) physical"
+          echo "memory:    $(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 )) GiB"
+          echo "macos:     $(sw_vers -productVersion) ($(sw_vers -buildVersion))"
+          echo "xcode:     $(xcodebuild -version 2>/dev/null | tr '\n' ' ' || echo unknown)"
+          echo "sdk:       $(xcrun --show-sdk-version 2>/dev/null || echo unknown)"
+          echo "disk:"
+          df -h / "$RUNNER_TEMP" 2>/dev/null || df -h
+
       - name: Create src dir
         run: mkdir -p src
 
@@ -326,6 +340,20 @@ jobs:
       TARGET_PLATFORM: win
       TARGET_ARCH: x64
     steps:
+      - name: Runner specs
+        run: |
+          echo "runner:    $RUNNER_NAME ($RUNNER_OS/$RUNNER_ARCH)"
+          powershell -NoProfile -Command "\
+            \$cpu = Get-CimInstance Win32_Processor | Select-Object -First 1; \
+            \$cs  = Get-CimInstance Win32_ComputerSystem; \
+            \$os  = Get-CimInstance Win32_OperatingSystem; \
+            Write-Output ('cpu:       ' + \$cpu.Name); \
+            Write-Output ('cores:     ' + \$cpu.NumberOfLogicalProcessors + ' logical, ' + \$cpu.NumberOfCores + ' physical'); \
+            Write-Output ('memory:    ' + [math]::Round(\$cs.TotalPhysicalMemory / 1GB) + ' GiB'); \
+            Write-Output ('windows:   ' + \$os.Caption + ' ' + \$os.Version)" || true
+          echo "disk:"
+          df -h 2>/dev/null || true
+
       - name: Configure git for Windows Chromium
         run: |
           git config --global core.filemode false
