@@ -120,7 +120,7 @@ run_pass() {
 "$SCRIPT_DIR/out-cache.sh" restore
 
 if [ "$USE_OUT_CACHE" = "true" ] && [ -f "${OUT_DIR:-src/out/Release}/.ninja_log" ]; then
-  "$SCRIPT_DIR/verify-out-cache.sh"
+  GN_EXTRA_ARGS="$(gn_extra_args)" "$SCRIPT_DIR/verify-out-cache.sh"
 fi
 
 rc=0

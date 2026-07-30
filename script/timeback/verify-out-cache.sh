@@ -24,8 +24,12 @@ framework_bytes=$(stat -f '%z' "$OUT_DIR/obj/electron/electron_framework_shared_
 dry_run=$(mktemp)
 trap 'rm -f "$dry_run"' EXIT
 
-# `e build` runs autoninja for the `electron` target. Dry-running that exact
-# target regenerates ninja/xcode_links if necessary but executes no build edge.
+# `e build` regenerates GN before invoking autoninja. A dry-run alone can inspect
+# the stale restored graph and badly undercount pending edges, so force the same
+# regeneration first. GN_EXTRA_ARGS is identical to the real build's.
+CI=1 e d gn gen "$OUT_DIR"
+
+# Dry-run the regenerated graph. This executes no build edge.
 e d autoninja -C "$OUT_DIR" -n electron > "$dry_run" 2>&1 || {
   echo "resume preflight failed: ninja dry-run errored" >&2
   tail -100 "$dry_run" >&2
