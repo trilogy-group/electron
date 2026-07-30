@@ -569,7 +569,13 @@ jobs:
   publish:
     name: Publish Release + npm
     needs: [build-mac, build-win]
-    if: ${{ always() && inputs.publish && (needs.build-mac.result == 'success' || needs.build-win.result == 'success') }}
+    if: >-
+      ${{
+        always() &&
+        inputs.publish &&
+        (!inputs.build_mac || needs.build-mac.result == 'success') &&
+        (!inputs.build_win || needs.build-win.result == 'success')
+      }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
