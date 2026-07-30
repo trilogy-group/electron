@@ -15,7 +15,9 @@
 # so a failure hours into the build never costs us the sync again. The compile itself
 # runs in timed passes (see script/timeback/build-resumable.sh) that checkpoint
 # out/Release to S3 in between, so dying at ninja target 41k of 42k replays only the
-# last pass instead of the whole build.
+# last pass instead of the whole build. A failed compile checkpoints immediately with
+# no time limit; the pass budget only bounds what a hard kill (manual cancel or job
+# timeout) can cost, since GitHub force-terminates a cancelled job after 5 minutes.
 #
 # Publish destinations:
 #   1) GitHub Releases  → https://github.com/trilogy-group/electron/releases
@@ -52,9 +54,9 @@ on:
         description: 'Checkpoint out/Release to S3 so a failed/timed-out compile resumes'
         type: boolean
         default: true
-      snapshot_interval_seconds:
-        description: 'Seconds of compiling between out/Release checkpoints'
-        default: '4500'
+      checkpoint_interval_seconds:
+        description: 'Widest gap between out/Release checkpoints (first is 15m, then it widens to this)'
+        default: '1800'
       use_sccache:
         description: 'Also cache compile objects via sccache (unvalidated on official PGO builds)'
         type: boolean
@@ -78,7 +80,7 @@ env:
   AWS_MAX_ATTEMPTS: '5'
   OUT_DIR: src/out/Release
   USE_OUT_CACHE: ${{ inputs.use_out_cache }}
-  SNAPSHOT_INTERVAL_SECONDS: ${{ inputs.snapshot_interval_seconds }}
+  MAX_CHECKPOINT_SECONDS: ${{ inputs.checkpoint_interval_seconds }}
 
 jobs:
   build-mac:

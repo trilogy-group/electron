@@ -11,8 +11,13 @@ set -uo pipefail
 
 : "${ELECTRON_VERSION:?ELECTRON_VERSION is required}"
 
-readonly SNAPSHOT_INTERVAL_SECONDS="${SNAPSHOT_INTERVAL_SECONDS:-4500}"
-readonly MAX_PASSES="${MAX_PASSES:-8}"
+# Checkpoints start close together and widen. Early on there is little compiled
+# output, so a checkpoint is cheap and protects work that would otherwise be
+# wholly unprotected; later checkpoints are deltas, so a wider spacing keeps the
+# pause overhead down without ever risking more than MAX_CHECKPOINT_SECONDS.
+readonly FIRST_CHECKPOINT_SECONDS="${FIRST_CHECKPOINT_SECONDS:-900}"
+readonly MAX_CHECKPOINT_SECONDS="${MAX_CHECKPOINT_SECONDS:-1800}"
+readonly MAX_PASSES="${MAX_PASSES:-40}"
 readonly POLL_SECONDS=15
 readonly PAUSED_RC=124
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,9 +36,21 @@ gn_extra_args() {
   printf '%s' "$args"
 }
 
+checkpoint_interval_for_pass() {
+  local pass="$1" interval="$FIRST_CHECKPOINT_SECONDS"
+  while [ "$pass" -gt 1 ] && [ "$interval" -lt "$MAX_CHECKPOINT_SECONDS" ]; do
+    interval=$(( interval * 2 ))
+    pass=$(( pass - 1 ))
+  done
+  if [ "$interval" -gt "$MAX_CHECKPOINT_SECONDS" ]; then
+    interval="$MAX_CHECKPOINT_SECONDS"
+  fi
+  printf '%s' "$interval"
+}
+
 # Runs one pass, returning PAUSED_RC if the time budget expired first.
 run_pass() {
-  local pid deadline
+  local budget="$1" pid deadline
   # Job control gives the pass its own process group, so the signal below
   # reaches ninja and its compiler children rather than just the `e` wrapper.
   set -m
@@ -41,10 +58,10 @@ run_pass() {
   pid=$!
   set +m
 
-  deadline=$(( SECONDS + SNAPSHOT_INTERVAL_SECONDS ))
+  deadline=$(( SECONDS + budget ))
   while kill -0 "$pid" 2>/dev/null; do
     if (( SECONDS >= deadline )); then
-      echo "pass reached its ${SNAPSHOT_INTERVAL_SECONDS}s budget; pausing ninja to checkpoint"
+      echo "pass reached its ${budget}s budget; pausing ninja to checkpoint"
       kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
       wait "$pid" 2>/dev/null
       return "$PAUSED_RC"
@@ -59,8 +76,9 @@ run_pass() {
 
 rc=0
 for pass in $(seq 1 "$MAX_PASSES"); do
-  echo "::group::build pass ${pass}/${MAX_PASSES}"
-  run_pass
+  budget=$(checkpoint_interval_for_pass "$pass")
+  echo "::group::build pass ${pass}/${MAX_PASSES} (checkpoint after ${budget}s)"
+  run_pass "$budget"
   rc=$?
   echo "::endgroup::"
 
