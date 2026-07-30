@@ -18,6 +18,12 @@ set -uo pipefail
 readonly SANITY_FILE=build.ninja
 readonly S3_CONCURRENCY=32
 readonly SYNC_FLAGS=(--only-show-errors --no-progress)
+# xcode_links is a tree of symlinks gn regenerates from the local Xcode SDK on
+# every runner. aws s3 sync cannot mirror it faithfully (it follows links and
+# chokes on the SDK's recursive/broken ones), so a restored copy leaves gn with
+# dangling .defs inputs and the build dies at "Regenerating ninja files". Keep it
+# out of the cache in both directions; gn recreates it locally.
+readonly CACHE_EXCLUDES=(--exclude "xcode_links/*" --exclude "xcode_links/**")
 
 OUT_DIR="${OUT_DIR:-src/out/Release}"
 USE_OUT_CACHE="${USE_OUT_CACHE:-true}"
@@ -35,6 +41,10 @@ readonly S3_URI="s3://${CACHE_BUCKET}/${OUT_CACHE_PREFIX%/}"
 # Chromium's out dir is ~100k files; the CLI default of 10 parallel requests
 # makes both directions needlessly slow.
 aws configure set default.s3.max_concurrent_requests "$S3_CONCURRENCY" || true
+# AWS CLI v2 defaults to mandatory checksums that need a seekable stream; s3 sync
+# retries then fail with "Need to rewind the stream ... not seekable".
+export AWS_REQUEST_CHECKSUM_CALCULATION="${AWS_REQUEST_CHECKSUM_CALCULATION:-when_required}"
+export AWS_RESPONSE_CHECKSUM_VALIDATION="${AWS_RESPONSE_CHECKSUM_VALIDATION:-when_required}"
 
 restore() {
   if [ -f "$OUT_DIR/$SANITY_FILE" ]; then
@@ -48,9 +58,14 @@ restore() {
 
   echo "out cache HIT: ${OUT_CACHE_PREFIX}"
   mkdir -p "$OUT_DIR"
-  if aws s3 sync "$S3_URI" "$OUT_DIR" "${SYNC_FLAGS[@]}" \
+  if aws s3 sync "$S3_URI" "$OUT_DIR" "${SYNC_FLAGS[@]}" "${CACHE_EXCLUDES[@]}" \
      && [ -f "$OUT_DIR/$SANITY_FILE" ]; then
-    echo "restored $OUT_DIR ($(du -sh "$OUT_DIR" | cut -f1))"
+    # xcode_links is excluded from the mirror, so a checkpoint saved before that
+    # exclude (or on another runner) can leave build.ninja referencing SDK paths
+    # gn must regenerate locally. Drop the ninja stamp files so the next build
+    # pass reruns gn instead of dying on missing Mach .defs.
+    rm -f "$OUT_DIR/build.ninja" "$OUT_DIR/build.ninja.stamp" "$OUT_DIR/toolchain.ninja"
+    echo "restored $OUT_DIR ($(du -sh "$OUT_DIR" | cut -f1)); invalidated ninja files for xcode_links regen"
     return 0
   fi
 
@@ -73,11 +88,16 @@ save() {
     return 0
   fi
 
+  # gn recreates xcode_links on the next pass; delete it before upload so aws s3
+  # sync does not traverse the SDK's recursive/broken symlinks (which makes the
+  # checkpoint fail even with --exclude).
+  rm -rf "$OUT_DIR/xcode_links"
+
   # --delete keeps the mirror from accumulating outputs ninja has dropped, and
   # --exclude keeps the stamp itself out of the mirror.
   echo "checkpointing changed files in $OUT_DIR -> ${OUT_CACHE_PREFIX}"
   if ! aws s3 sync "$OUT_DIR" "$S3_URI" "${SYNC_FLAGS[@]}" \
-       --delete --exclude "$(basename "$stamp")"; then
+       --delete "${CACHE_EXCLUDES[@]}" --exclude "$(basename "$stamp")"; then
     echo "checkpoint upload failed"
     return 1
   fi

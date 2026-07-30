@@ -15,10 +15,13 @@ set -uo pipefail
 # output, so a checkpoint is cheap and protects work that would otherwise be
 # wholly unprotected; later checkpoints are deltas, so a wider spacing keeps the
 # pause overhead down without ever risking more than MAX_CHECKPOINT_SECONDS.
-readonly FIRST_CHECKPOINT_SECONDS="${FIRST_CHECKPOINT_SECONDS:-900}"
-readonly MAX_CHECKPOINT_SECONDS="${MAX_CHECKPOINT_SECONDS:-1800}"
-readonly MAX_PASSES="${MAX_PASSES:-40}"
+readonly FIRST_CHECKPOINT_SECONDS="${FIRST_CHECKPOINT_SECONDS:-300}"
+readonly MAX_CHECKPOINT_SECONDS="${MAX_CHECKPOINT_SECONDS:-900}"
+readonly MAX_PASSES="${MAX_PASSES:-80}"
 readonly POLL_SECONDS=15
+# Measured: a pause plus delta upload costs about a minute, so checkpointing every
+# 15 minutes trades ~7% of build time for a 15-minute worst case on a hard kill.
+readonly HEARTBEAT_SECONDS="${HEARTBEAT_SECONDS:-300}"
 readonly PAUSED_RC=124
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -48,6 +51,16 @@ checkpoint_interval_for_pass() {
   printf '%s' "$interval"
 }
 
+# Every edge ninja has ever completed in this build dir, across passes and runs.
+edges_completed() {
+  local log="${OUT_DIR:-src/out/Release}/.ninja_log"
+  if [ -f "$log" ]; then
+    wc -l < "$log" | tr -d ' '
+  else
+    echo 0
+  fi
+}
+
 # Runs one pass, returning PAUSED_RC if the time budget expired first.
 run_pass() {
   local budget="$1" pid deadline
@@ -59,11 +72,29 @@ run_pass() {
   set +m
 
   deadline=$(( SECONDS + budget ))
+  local next_heartbeat=$(( SECONDS + HEARTBEAT_SECONDS ))
   while kill -0 "$pid" 2>/dev/null; do
+    # Ninja's own progress counter resets every pass and GitHub stops streaming
+    # long-running step output, so report cumulative progress on our own clock.
+    if (( SECONDS >= next_heartbeat )); then
+      echo "still compiling: $(edges_completed) edges done, $(( (deadline - SECONDS) / 60 ))m until the next checkpoint"
+      next_heartbeat=$(( SECONDS + HEARTBEAT_SECONDS ))
+    fi
     if (( SECONDS >= deadline )); then
       echo "pass reached its ${budget}s budget; pausing ninja to checkpoint"
       kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
-      wait "$pid" 2>/dev/null
+      # Ninja sometimes ignores TERM while compiler children finish; a blocking
+      # wait here has hung the job for 30+ minutes with no further log output.
+      local term_deadline=$(( SECONDS + 120 ))
+      while kill -0 "$pid" 2>/dev/null; do
+        if (( SECONDS >= term_deadline )); then
+          echo "ninja did not exit after TERM; sending KILL"
+          kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+          break
+        fi
+        sleep 2
+      done
+      wait "$pid" 2>/dev/null || true
       return "$PAUSED_RC"
     fi
     sleep "$POLL_SECONDS"
@@ -77,10 +108,11 @@ run_pass() {
 rc=0
 for pass in $(seq 1 "$MAX_PASSES"); do
   budget=$(checkpoint_interval_for_pass "$pass")
-  echo "::group::build pass ${pass}/${MAX_PASSES} (checkpoint after ${budget}s)"
+  # Deliberately not a ::group::; collapsed groups stop streaming in the UI, which
+  # made a healthy multi-hour compile look frozen.
+  echo "=== build pass ${pass}/${MAX_PASSES}: $(edges_completed) edges done, checkpoint after ${budget}s ==="
   run_pass "$budget"
   rc=$?
-  echo "::endgroup::"
 
   snapshot
 
