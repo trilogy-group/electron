@@ -18,6 +18,12 @@ set -uo pipefail
 readonly SANITY_FILE=build.ninja
 readonly S3_CONCURRENCY=32
 readonly SYNC_FLAGS=(--only-show-errors --no-progress)
+# xcode_links is a tree of symlinks gn regenerates from the local Xcode SDK on
+# every runner. aws s3 sync cannot mirror it faithfully (it follows links and
+# chokes on the SDK's recursive/broken ones), so a restored copy leaves gn with
+# dangling .defs inputs and the build dies at "Regenerating ninja files". Keep it
+# out of the cache in both directions; gn recreates it locally.
+readonly CACHE_EXCLUDES=(--exclude "xcode_links/*")
 
 OUT_DIR="${OUT_DIR:-src/out/Release}"
 USE_OUT_CACHE="${USE_OUT_CACHE:-true}"
@@ -52,7 +58,7 @@ restore() {
 
   echo "out cache HIT: ${OUT_CACHE_PREFIX}"
   mkdir -p "$OUT_DIR"
-  if aws s3 sync "$S3_URI" "$OUT_DIR" "${SYNC_FLAGS[@]}" \
+  if aws s3 sync "$S3_URI" "$OUT_DIR" "${SYNC_FLAGS[@]}" "${CACHE_EXCLUDES[@]}" \
      && [ -f "$OUT_DIR/$SANITY_FILE" ]; then
     echo "restored $OUT_DIR ($(du -sh "$OUT_DIR" | cut -f1))"
     return 0
@@ -81,7 +87,7 @@ save() {
   # --exclude keeps the stamp itself out of the mirror.
   echo "checkpointing changed files in $OUT_DIR -> ${OUT_CACHE_PREFIX}"
   if ! aws s3 sync "$OUT_DIR" "$S3_URI" "${SYNC_FLAGS[@]}" \
-       --delete --exclude "$(basename "$stamp")"; then
+       --delete "${CACHE_EXCLUDES[@]}" --exclude "$(basename "$stamp")"; then
     echo "checkpoint upload failed"
     return 1
   fi
