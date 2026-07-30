@@ -11,9 +11,9 @@ set -uo pipefail
 
 : "${ELECTRON_VERSION:?ELECTRON_VERSION is required}"
 
-# End each pass after 1,000 new unique outputs or 15 minutes, whichever happens
+# End each pass after 2,500 new unique outputs or 15 minutes, whichever happens
 # first. One pass termination always produces exactly one checkpoint.
-readonly CHECKPOINT_EDGE_INTERVAL="${CHECKPOINT_EDGE_INTERVAL:-1000}"
+readonly CHECKPOINT_EDGE_INTERVAL="${CHECKPOINT_EDGE_INTERVAL:-2500}"
 readonly MAX_CHECKPOINT_SECONDS="${MAX_CHECKPOINT_SECONDS:-900}"
 readonly MAX_PASSES="${MAX_PASSES:-100}"
 readonly POLL_SECONDS=15
