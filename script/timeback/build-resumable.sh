@@ -22,6 +22,10 @@ readonly POLL_SECONDS=15
 # Measured: a pause plus delta upload costs about a minute, so checkpointing every
 # 15 minutes trades ~7% of build time for a 15-minute worst case on a hard kill.
 readonly HEARTBEAT_SECONDS="${HEARTBEAT_SECONDS:-300}"
+# Ninja prints a line per edge, which for ~100k edges overruns the log limits and
+# leaves the Actions UI hours behind. Progress is thinned to one line per interval;
+# diagnostics still come through in full.
+readonly PROGRESS_INTERVAL_SECONDS="${PROGRESS_INTERVAL_SECONDS:-10}"
 readonly PAUSED_RC=124
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -63,11 +67,15 @@ edges_completed() {
 
 # Runs one pass, returning PAUSED_RC if the time budget expired first.
 run_pass() {
-  local budget="$1" pid deadline
+  local budget="$1" pid deadline rc_file build_rc
+  # The throttler is the tail of a pipeline, so the build's own status has to
+  # travel out of band.
+  rc_file="$(mktemp)"
   # Job control gives the pass its own process group, so the signal below
   # reaches ninja and its compiler children rather than just the `e` wrapper.
   set -m
-  CI=1 GN_EXTRA_ARGS="$(gn_extra_args)" e build --no-remote &
+  { CI=1 GN_EXTRA_ARGS="$(gn_extra_args)" e build --no-remote 2>&1; echo $? > "$rc_file"; } \
+    | python3 "$SCRIPT_DIR/throttle-build-output.py" "$PROGRESS_INTERVAL_SECONDS" &
   pid=$!
   set +m
 
@@ -95,12 +103,18 @@ run_pass() {
         sleep 2
       done
       wait "$pid" 2>/dev/null || true
+      rm -f "$rc_file"
       return "$PAUSED_RC"
     fi
     sleep "$POLL_SECONDS"
   done
 
-  wait "$pid"
+  wait "$pid" 2>/dev/null || true
+  # An empty file means the build died without recording a status, which is a
+  # failure however the pipeline itself exited.
+  build_rc="$(cat "$rc_file" 2>/dev/null)"
+  rm -f "$rc_file"
+  return "${build_rc:-1}"
 }
 
 "$SCRIPT_DIR/out-cache.sh" restore
