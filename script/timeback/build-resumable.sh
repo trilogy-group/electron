@@ -63,7 +63,18 @@ run_pass() {
     if (( SECONDS >= deadline )); then
       echo "pass reached its ${budget}s budget; pausing ninja to checkpoint"
       kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
-      wait "$pid" 2>/dev/null
+      # Ninja sometimes ignores TERM while compiler children finish; a blocking
+      # wait here has hung the job for 30+ minutes with no further log output.
+      local term_deadline=$(( SECONDS + 120 ))
+      while kill -0 "$pid" 2>/dev/null; do
+        if (( SECONDS >= term_deadline )); then
+          echo "ninja did not exit after TERM; sending KILL"
+          kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+          break
+        fi
+        sleep 2
+      done
+      wait "$pid" 2>/dev/null || true
       return "$PAUSED_RC"
     fi
     sleep "$POLL_SECONDS"

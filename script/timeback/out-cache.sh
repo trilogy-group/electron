@@ -88,6 +88,11 @@ save() {
     return 0
   fi
 
+  # gn recreates xcode_links on the next pass; delete it before upload so aws s3
+  # sync does not traverse the SDK's recursive/broken symlinks (which makes the
+  # checkpoint fail even with --exclude).
+  rm -rf "$OUT_DIR/xcode_links"
+
   # --delete keeps the mirror from accumulating outputs ninja has dropped, and
   # --exclude keeps the stamp itself out of the mirror.
   echo "checkpointing changed files in $OUT_DIR -> ${OUT_CACHE_PREFIX}"
