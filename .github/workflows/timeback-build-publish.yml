@@ -159,8 +159,21 @@ jobs:
             echo "hit=true" >> "$GITHUB_OUTPUT"
             echo "Cache HIT for $CACHE_KEY"
           else
-            echo "hit=false" >> "$GITHUB_OUTPUT"
-            echo "Cache MISS for $CACHE_KEY"
+            # An earlier run may have finished uploading but died before promoting
+            # its temp key. Adopt the newest such object rather than cold-syncing.
+            # `aws s3 ls` prints basenames, so re-attach the key's directory.
+            ORPHAN=$(aws s3 ls "s3://$CACHE_BUCKET/${CACHE_KEY}.upload-" 2>/dev/null \
+              | sort | tail -1 | awk '{print $4}')
+            if [ -n "$ORPHAN" ]; then
+              ORPHAN="$(dirname "$CACHE_KEY")/$ORPHAN"
+              echo "Adopting orphaned upload $ORPHAN"
+              aws s3 mv "s3://$CACHE_BUCKET/$ORPHAN" "s3://$CACHE_BUCKET/$CACHE_KEY"
+              echo "hit=true" >> "$GITHUB_OUTPUT"
+              echo "Cache HIT (recovered orphan) for $CACHE_KEY"
+            else
+              echo "hit=false" >> "$GITHUB_OUTPUT"
+              echo "Cache MISS for $CACHE_KEY"
+            fi
           fi
 
       - name: Init build config
@@ -207,6 +220,7 @@ jobs:
 
       - name: Save src cache
         if: ${{ steps.src-cache.outputs.hit != 'true' && inputs.use_src_cache }}
+        continue-on-error: true
         run: |
           set -euo pipefail
           # Mirror upstream's cache shape: drop .git dirs (except angle/dawn, whose
@@ -392,8 +406,21 @@ jobs:
             echo "hit=true" >> "$GITHUB_OUTPUT"
             echo "Cache HIT for $CACHE_KEY"
           else
-            echo "hit=false" >> "$GITHUB_OUTPUT"
-            echo "Cache MISS for $CACHE_KEY"
+            # An earlier run may have finished uploading but died before promoting
+            # its temp key. Adopt the newest such object rather than cold-syncing.
+            # `aws s3 ls` prints basenames, so re-attach the key's directory.
+            ORPHAN=$(aws s3 ls "s3://$CACHE_BUCKET/${CACHE_KEY}.upload-" 2>/dev/null \
+              | sort | tail -1 | awk '{print $4}')
+            if [ -n "$ORPHAN" ]; then
+              ORPHAN="$(dirname "$CACHE_KEY")/$ORPHAN"
+              echo "Adopting orphaned upload $ORPHAN"
+              aws s3 mv "s3://$CACHE_BUCKET/$ORPHAN" "s3://$CACHE_BUCKET/$CACHE_KEY"
+              echo "hit=true" >> "$GITHUB_OUTPUT"
+              echo "Cache HIT (recovered orphan) for $CACHE_KEY"
+            else
+              echo "hit=false" >> "$GITHUB_OUTPUT"
+              echo "Cache MISS for $CACHE_KEY"
+            fi
           fi
 
       - name: Init build config
@@ -432,6 +459,7 @@ jobs:
 
       - name: Save src cache
         if: ${{ steps.src-cache.outputs.hit != 'true' && inputs.use_src_cache }}
+        continue-on-error: true
         run: |
           set -euo pipefail
           find src -type d -name .git \
