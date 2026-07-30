@@ -35,6 +35,10 @@ readonly S3_URI="s3://${CACHE_BUCKET}/${OUT_CACHE_PREFIX%/}"
 # Chromium's out dir is ~100k files; the CLI default of 10 parallel requests
 # makes both directions needlessly slow.
 aws configure set default.s3.max_concurrent_requests "$S3_CONCURRENCY" || true
+# AWS CLI v2 defaults to mandatory checksums that need a seekable stream; s3 sync
+# retries then fail with "Need to rewind the stream ... not seekable".
+export AWS_REQUEST_CHECKSUM_CALCULATION="${AWS_REQUEST_CHECKSUM_CALCULATION:-when_required}"
+export AWS_RESPONSE_CHECKSUM_VALIDATION="${AWS_RESPONSE_CHECKSUM_VALIDATION:-when_required}"
 
 restore() {
   if [ -f "$OUT_DIR/$SANITY_FILE" ]; then
