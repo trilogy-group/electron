@@ -7,6 +7,7 @@
 # Caching (our own, since Electron's Azure src cache + RBE are maintainer-only):
 #   src-cache/<platform>/v2-src-cache-<depshash>.tar.zst  → synced Chromium tree
 #   out-cache/<platform>-<arch>/<depshash>/                → mirrored out/Release
+#     baseline.tar.zst                                     → fast restore (~10-20 min)
 #   sccache/                                              → compile object cache (opt-in)
 # Both live in s3://timeback-electron-src-cache (tbdev, 60-day lifecycle), reached
 # via OIDC role TimebackElectronCacheRole which is scoped to this repo + those prefixes.
