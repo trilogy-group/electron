@@ -119,6 +119,10 @@ run_pass() {
 
 "$SCRIPT_DIR/out-cache.sh" restore
 
+if [ "$USE_OUT_CACHE" = "true" ] && [ -f "${OUT_DIR:-src/out/Release}/.ninja_log" ]; then
+  "$SCRIPT_DIR/verify-out-cache.sh"
+fi
+
 rc=0
 for pass in $(seq 1 "$MAX_PASSES"); do
   budget=$(checkpoint_interval_for_pass "$pass")
