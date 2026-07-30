@@ -23,7 +23,7 @@ readonly SYNC_FLAGS=(--only-show-errors --no-progress)
 # chokes on the SDK's recursive/broken ones), so a restored copy leaves gn with
 # dangling .defs inputs and the build dies at "Regenerating ninja files". Keep it
 # out of the cache in both directions; gn recreates it locally.
-readonly CACHE_EXCLUDES=(--exclude "xcode_links/*")
+readonly CACHE_EXCLUDES=(--exclude "xcode_links/*" --exclude "xcode_links/**")
 
 OUT_DIR="${OUT_DIR:-src/out/Release}"
 USE_OUT_CACHE="${USE_OUT_CACHE:-true}"
@@ -60,7 +60,12 @@ restore() {
   mkdir -p "$OUT_DIR"
   if aws s3 sync "$S3_URI" "$OUT_DIR" "${SYNC_FLAGS[@]}" "${CACHE_EXCLUDES[@]}" \
      && [ -f "$OUT_DIR/$SANITY_FILE" ]; then
-    echo "restored $OUT_DIR ($(du -sh "$OUT_DIR" | cut -f1))"
+    # xcode_links is excluded from the mirror, so a checkpoint saved before that
+    # exclude (or on another runner) can leave build.ninja referencing SDK paths
+    # gn must regenerate locally. Drop the ninja stamp files so the next build
+    # pass reruns gn instead of dying on missing Mach .defs.
+    rm -f "$OUT_DIR/build.ninja" "$OUT_DIR/build.ninja.stamp" "$OUT_DIR/toolchain.ninja"
+    echo "restored $OUT_DIR ($(du -sh "$OUT_DIR" | cut -f1)); invalidated ninja files for xcode_links regen"
     return 0
   fi
 
