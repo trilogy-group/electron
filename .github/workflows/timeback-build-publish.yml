@@ -181,8 +181,10 @@ jobs:
             # An earlier run may have finished uploading but died before promoting
             # its temp key. Adopt the newest such object rather than cold-syncing.
             # `aws s3 ls` prints basenames, so re-attach the key's directory.
+            # aws s3 ls exits 1 when no keys match; with pipefail that would
+            # abort the step before we can report a miss and cold-sync.
             ORPHAN=$(aws s3 ls "s3://$CACHE_BUCKET/${CACHE_KEY}.upload-" 2>/dev/null \
-              | sort | tail -1 | awk '{print $4}')
+              | sort | tail -1 | awk '{print $4}' || true)
             if [ -n "$ORPHAN" ]; then
               ORPHAN="$(dirname "$CACHE_KEY")/$ORPHAN"
               echo "Adopting orphaned upload $ORPHAN"
@@ -455,8 +457,10 @@ jobs:
             # An earlier run may have finished uploading but died before promoting
             # its temp key. Adopt the newest such object rather than cold-syncing.
             # `aws s3 ls` prints basenames, so re-attach the key's directory.
+            # aws s3 ls exits 1 when no keys match; with pipefail that would
+            # abort the step before we can report a miss and cold-sync.
             ORPHAN=$(aws s3 ls "s3://$CACHE_BUCKET/${CACHE_KEY}.upload-" 2>/dev/null \
-              | sort | tail -1 | awk '{print $4}')
+              | sort | tail -1 | awk '{print $4}' || true)
             if [ -n "$ORPHAN" ]; then
               ORPHAN="$(dirname "$CACHE_KEY")/$ORPHAN"
               echo "Adopting orphaned upload $ORPHAN"
