@@ -1,0 +1,225 @@
+# TimeBack: rehearse the publish pipeline without compiling Chromium.
+#
+# Why this exists: the compile takes ~6 hours, and until this workflow existed every
+# step *after* the compile (packaging, Release creation, checksums, npm rewrite,
+# @electron/get resolving our mirror, a consumer's `npm install`) had never run even
+# once. A single typo in any of them cost another full rebuild to discover.
+#
+# So this workflow fabricates zips that are shaped like real Electron dist zips,
+# hands them to the *real* publish workflow (timeback-publish.yml — the same file the
+# build flow calls), and then installs the published package on a clean macOS and
+# Windows runner the way a developer would. Total cost: a couple of minutes.
+#
+# It publishes under a throwaway version (0.0.0-rehearsal.<run number>) and a
+# `rehearsal` dist-tag, marks the Release as a prerelease, and deletes both afterwards
+# so nothing here can be mistaken for a shippable build.
+#
+# Re-run twice with the same explicit `version` to also exercise the republish path
+# (GitHub Packages refusing to overwrite an existing version).
+
+name: TimeBack Publish Rehearsal
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to rehearse with (blank = 43.2.0-rehearsal.<run number>)'
+        required: false
+        default: ''
+      cleanup:
+        description: 'Delete the rehearsal Release, tag and package version afterwards'
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  # Two rehearsals at once would fight over the same Release/tag.
+  group: timeback-publish-rehearsal
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Pick rehearsal version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+    steps:
+      - name: Pick version
+        id: pick
+        run: |
+          set -euo pipefail
+          V="${{ inputs.version }}"
+          if [ -z "$V" ]; then
+            # Deliberately 43.2.0-*, not 0.0.0-*: @electron/get only verifies
+            # checksums for versions >= 1.3.2, so a 0.0.0 rehearsal would skip the
+            # checksum path and pass even with a broken checksums.json.
+            V="43.2.0-rehearsal.${{ github.run_number }}"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "rehearsing with version $V"
+
+  # Stand in for build-mac / build-win. Same artifact naming, same zip layout, so the
+  # publish workflow cannot tell the difference — which is the point.
+  stub-artifacts:
+    name: Stub ${{ matrix.platform }}-${{ matrix.arch }}
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - platform: darwin
+            arch: arm64
+          - platform: win32
+            arch: x64
+          - platform: win32
+            arch: arm64
+    env:
+      ELECTRON_VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - name: Build a stub dist zip
+        run: |
+          set -euo pipefail
+          PLATFORM='${{ matrix.platform }}'
+          ARCH='${{ matrix.arch }}'
+          STAGE="stage"
+          mkdir -p "$STAGE"
+
+          # @electron/get only unzips and checksums the archive; index.js then expects
+          # the platform's executable at the path install.js records in path.txt.
+          # Reproduce exactly that much so the plumbing is tested for real.
+          if [ "$PLATFORM" = "darwin" ]; then
+            BIN_DIR="$STAGE/Electron.app/Contents/MacOS"
+            BIN="$BIN_DIR/Electron"
+          else
+            BIN_DIR="$STAGE"
+            BIN="$STAGE/electron.exe"
+          fi
+          mkdir -p "$BIN_DIR"
+          cat > "$BIN" <<EOF
+          #!/bin/sh
+          echo "TimeBack stub Electron ${ELECTRON_VERSION} ($PLATFORM-$ARCH)"
+          EOF
+          chmod +x "$BIN"
+
+          # install.js compares dist/version against the package version on re-install.
+          echo "v${ELECTRON_VERSION}" > "$STAGE/version"
+          echo "Stub artifact for pipeline rehearsal only. Not a real Electron build." > "$STAGE/LICENSE"
+
+          ARTIFACT="electron-v${ELECTRON_VERSION}-${PLATFORM}-${ARCH}.zip"
+          mkdir -p artifacts
+          ( cd "$STAGE" && zip -qr "../artifacts/$ARTIFACT" . )
+          unzip -l "artifacts/$ARTIFACT"
+          ls -lh artifacts
+
+      - name: Upload stub artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: electron-${{ matrix.platform }}-${{ matrix.arch }}
+          path: artifacts/*.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  # The real thing. Any failure here is a bug we would otherwise have hit only after
+  # a 6-hour compile.
+  publish:
+    name: Publish (rehearsal)
+    needs: [plan, stub-artifacts]
+    permissions:
+      contents: write
+      packages: write
+    uses: ./.github/workflows/timeback-publish.yml
+    with:
+      version: ${{ needs.plan.outputs.version }}
+      mirror: https://github.com/trilogy-group/electron/releases/download/
+      prerelease: true
+      npm_tag: rehearsal
+
+  # The publish job verifies installs on its own runner. This job is the part that
+  # cannot be faked: a clean machine, no repo checkout, no AWS, installing the
+  # published package straight from GitHub Packages exactly as a developer would.
+  consume:
+    name: Consume on ${{ matrix.os }}
+    needs: [plan, publish]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    env:
+      ELECTRON_VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.x'
+
+      - name: Install @trilogy-group/electron from GitHub Packages
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p consumer && cd consumer
+          npm init -y >/dev/null
+          cat > .npmrc <<EOF
+          @trilogy-group:registry=https://npm.pkg.github.com
+          //npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}
+          EOF
+          npm install "@trilogy-group/electron@${ELECTRON_VERSION}" --no-audit --no-fund
+
+      - name: Resolve and run the binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd consumer
+          # First require() triggers the lazy download from our Release mirror.
+          node -e '
+            const fs = require("fs");
+            const p = require("@trilogy-group/electron");
+            if (typeof p !== "string") throw new Error("module did not export a path: " + p);
+            if (!fs.existsSync(p)) throw new Error("binary missing on disk: " + p);
+            console.log("resolved binary:", p);
+            require("fs").writeFileSync("binpath.txt", p);
+          '
+          BIN="$(cat binpath.txt)"
+          echo "--- binary output ---"
+          # Stub binaries are shell scripts, so sh runs them on Windows runners too.
+          sh "$BIN" || "$BIN"
+
+  cleanup:
+    name: Remove rehearsal artifacts
+    needs: [plan, publish, consume]
+    if: ${{ always() && inputs.cleanup }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    env:
+      ELECTRON_VERSION: ${{ needs.plan.outputs.version }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Delete rehearsal Release, tag and package version
+        run: |
+          set -euo pipefail
+          TAG="v${ELECTRON_VERSION}"
+
+          if gh release view "$TAG" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release delete "$TAG" -R "${{ github.repository }}" --yes --cleanup-tag \
+              && echo "deleted Release $TAG"
+          else
+            echo "no Release $TAG to delete"
+          fi
+
+          VERSION_ID=$(gh api \
+            "/orgs/${{ github.repository_owner }}/packages/npm/electron/versions" \
+            --jq ".[] | select(.name == \"${ELECTRON_VERSION}\") | .id" 2>/dev/null || true)
+          if [ -n "$VERSION_ID" ]; then
+            gh api -X DELETE \
+              "/orgs/${{ github.repository_owner }}/packages/npm/electron/versions/${VERSION_ID}" \
+              && echo "deleted package version ${ELECTRON_VERSION}" \
+              || echo "::warning::could not delete package version ${VERSION_ID}; remove it by hand"
+          else
+            echo "no package version ${ELECTRON_VERSION} to delete"
+          fi

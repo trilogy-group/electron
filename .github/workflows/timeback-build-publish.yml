@@ -576,6 +576,10 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # The publish logic lives in timeback-publish.yml so that
+  # timeback-publish-rehearsal.yml can exercise this exact code in ~2 minutes with
+  # stub zips. Do not inline it back here: an untested publish step turns a typo
+  # into another full Chromium rebuild.
   publish:
     name: Publish Release + npm
     needs: [build-mac, build-win]
@@ -586,184 +590,11 @@ jobs:
         (!inputs.build_mac || needs.build-mac.result == 'success') &&
         (!inputs.build_win || needs.build-win.result == 'success')
       }}
-    runs-on: ubuntu-latest
     permissions:
       contents: write
       packages: write
-    steps:
-      - name: Checkout npm package sources
-        uses: actions/checkout@v4
-        with:
-          path: electron
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist-zips
-          pattern: electron-*
-          merge-multiple: true
-
-      - name: List artifacts
-        run: |
-          find dist-zips -type f -print
-          ls -lah dist-zips
-
-      - name: Create GitHub Release (merge assets; never drop other arches)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          TAG="v${ELECTRON_VERSION}"
-          TITLE="TimeBack Electron ${ELECTRON_VERSION}"
-          NOTES="Patched Electron build for TimeBack (five Chromium crash patches).
-
-          ## Install (npm / GitHub Packages)
-          \`\`\`bash
-          npm install @trilogy-group/electron@${ELECTRON_VERSION} --registry=https://npm.pkg.github.com
-          \`\`\`
-
-          Or keep \`electron@${ELECTRON_VERSION}\` and set:
-          \`\`\`
-          ELECTRON_MIRROR=https://github.com/trilogy-group/electron/releases/download/
-          \`\`\`
-
-          Branch: \`${{ github.ref_name }}\`
-          Commit: \`${{ github.sha }}\`"
-
-          # --clobber replaces only same-named zips; other arch assets on the
-          # Release are left alone (mac publish does not wipe win, and vice versa).
-          if gh release view "$TAG" -R trilogy-group/electron >/dev/null 2>&1; then
-            echo "Release $TAG already exists — uploading/replacing assets from this run only"
-            gh release upload "$TAG" dist-zips/*.zip -R trilogy-group/electron --clobber
-          else
-            gh release create "$TAG" dist-zips/*.zip \
-              -R trilogy-group/electron \
-              --title "$TITLE" \
-              --notes "$NOTES" \
-              --target "${{ github.sha }}"
-          fi
-
-      - name: Build checksums.json from ALL Release assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          TAG="v${ELECTRON_VERSION}"
-          mkdir -p all-zips
-          # Start from this run's artifacts, then pull every electron-*.zip already
-          # on the Release so a Windows-only (or Mac-only) publish cannot shrink
-          # checksums.json and break the other platform's npm install.
-          cp dist-zips/*.zip all-zips/
-          gh release download "$TAG" -R trilogy-group/electron -D release-zips -p 'electron-*.zip'
-          for f in release-zips/electron-*.zip; do
-            [ -e "$f" ] || continue
-            base=$(basename "$f")
-            if [ ! -f "all-zips/$base" ]; then
-              cp "$f" "all-zips/$base"
-              echo "merged existing Release asset: $base"
-            fi
-          done
-          ls -lah all-zips
-          python3 <<'PY'
-          import hashlib, json, pathlib
-          root = pathlib.Path("all-zips")
-          checksums = {}
-          for path in sorted(root.glob("*.zip")):
-              h = hashlib.sha256()
-              with path.open("rb") as f:
-                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                      h.update(chunk)
-              checksums[path.name] = h.hexdigest()
-          pathlib.Path("checksums.json").write_text(json.dumps(checksums, indent=2) + "\n")
-          print(json.dumps(checksums, indent=2))
-          PY
-
-      - name: Prepare @trilogy-group/electron npm package
-        run: |
-          set -euo pipefail
-          mkdir -p npm-publish
-          cp -R electron/npm/. npm-publish/
-          cp checksums.json npm-publish/checksums.json
-
-          # Rewrite package.json for GitHub Packages + our mirror.
-          node <<'NODE'
-          const fs = require('fs');
-          const path = require('path');
-          const version = process.env.ELECTRON_VERSION;
-          const mirror = process.env.TIMEBACK_ELECTRON_MIRROR;
-          const pkgPath = path.join('npm-publish', 'package.json');
-          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-          pkg.name = '@trilogy-group/electron';
-          pkg.version = version;
-          pkg.repository = {
-            type: 'git',
-            url: 'git+https://github.com/trilogy-group/electron.git'
-          };
-          pkg.publishConfig = {
-            registry: 'https://npm.pkg.github.com'
-          };
-          // Ensure install resolves binaries from our Releases even without ELECTRON_MIRROR.
-          pkg.config = {
-            ...(pkg.config || {}),
-            electron_mirror: mirror,
-            electron_custom_dir: `v${version}`
-          };
-          fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
-
-          // Patch install.js to force our mirror (npm config is not always honored by @electron/get).
-          const installPath = path.join('npm-publish', 'install.js');
-          let install = fs.readFileSync(installPath, 'utf8');
-          if (!install.includes('TIMEBACK_MIRROR_INJECTED')) {
-            install = install.replace(
-              'downloadArtifact({',
-              `// TIMEBACK_MIRROR_INJECTED\nprocess.env.ELECTRON_MIRROR = process.env.ELECTRON_MIRROR || '${mirror}';\ndownloadArtifact({`
-            );
-            fs.writeFileSync(installPath, install);
-          }
-          console.log('Prepared', pkg.name, pkg.version);
-          NODE
-
-          # Need electron.d.ts from the repo for the package files list
-          if [ -f electron/electron.d.ts ]; then
-            cp electron/electron.d.ts npm-publish/electron.d.ts
-          elif [ -f electron/npm/electron.d.ts ]; then
-            cp electron/npm/electron.d.ts npm-publish/electron.d.ts
-          else
-            # Generated during full release; create a stub so pack does not fail if listed.
-            echo '// Types generated in official Electron releases; runtime package only.' > npm-publish/electron.d.ts
-          fi
-
-          # abi_version may be required by files list
-          if [ ! -f npm-publish/abi_version ] && [ -f electron/npm/abi_version ]; then
-            cp electron/npm/abi_version npm-publish/abi_version
-          elif [ ! -f npm-publish/abi_version ]; then
-            echo "0" > npm-publish/abi_version
-          fi
-
-          ls -la npm-publish
-
-      - name: Setup Node for GitHub Packages
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22.21.x'
-          registry-url: https://npm.pkg.github.com
-          scope: '@trilogy-group'
-
-      - name: Publish @trilogy-group/electron
-        working-directory: npm-publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # Same version may already exist from an earlier arch publish. Replace it
-          # so checksums.json gains the newly built platforms instead of sticking
-          # forever to the first arch that landed.
-          if npm view "@trilogy-group/electron@${ELECTRON_VERSION}" version \
-               --registry=https://npm.pkg.github.com >/dev/null 2>&1; then
-            echo "Version ${ELECTRON_VERSION} already on GitHub Packages — unpublishing to republish with merged checksums"
-            npm unpublish "@trilogy-group/electron@${ELECTRON_VERSION}" \
-              --registry=https://npm.pkg.github.com --force || true
-          fi
-          npm publish --access restricted
-          echo "Published @trilogy-group/electron@${ELECTRON_VERSION}"
-          echo "Binaries: ${TIMEBACK_ELECTRON_MIRROR}v${ELECTRON_VERSION}/"
+    uses: ./.github/workflows/timeback-publish.yml
+    with:
+      version: ${{ inputs.version }}
+      mirror: https://github.com/trilogy-group/electron/releases/download/
+      prerelease: false
