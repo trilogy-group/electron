@@ -8,46 +8,6 @@ Restores part of https://chromium-review.googlesource.com/c/chromium/src/+/67991
 Patch can be removed once cppgc migration is complete
 https://github.com/electron/electron/issues/47922
 
-diff --git a/content/services/auction_worklet/shared_storage_bindings.cc b/content/services/auction_worklet/shared_storage_bindings.cc
-index 222ea405c238032e332b14a27ad868d0664c14e5..3df51bf482070455614b0c4dec96c6258480b758 100644
---- a/content/services/auction_worklet/shared_storage_bindings.cc
-+++ b/content/services/auction_worklet/shared_storage_bindings.cc
-@@ -412,6 +412,8 @@ void SharedStorageBindings::AttachToContext(v8::Local<v8::Context> context) {
-         v8::FunctionTemplate::New(v8_helper_->isolate(),
-                                   &SharedStorageBindings::SetMethodConstructor,
-                                   v8_this);
-+    set_method_ctor_template->InstanceTemplate()->SetInternalFieldCount(
-+        gin::kNumberOfInternalFields);
-     set_method_ctor_template->Inherit(base_modifier_method_template);
-     set_method_ctor_template->SetClassName(
-         v8_helper_->CreateStringFromLiteral(kSharedStorageSetMethodName));
-@@ -427,6 +429,8 @@ void SharedStorageBindings::AttachToContext(v8::Local<v8::Context> context) {
-         v8::FunctionTemplate::New(
-             v8_helper_->isolate(),
-             &SharedStorageBindings::AppendMethodConstructor, v8_this);
-+    append_method_ctor_template->InstanceTemplate()->SetInternalFieldCount(
-+        gin::kNumberOfInternalFields);
-     append_method_ctor_template->Inherit(base_modifier_method_template);
-     append_method_ctor_template->SetClassName(
-         v8_helper_->CreateStringFromLiteral(kSharedStorageAppendMethodName));
-@@ -443,6 +447,8 @@ void SharedStorageBindings::AttachToContext(v8::Local<v8::Context> context) {
-         v8::FunctionTemplate::New(
-             v8_helper_->isolate(),
-             &SharedStorageBindings::DeleteMethodConstructor, v8_this);
-+    delete_method_ctor_template->InstanceTemplate()->SetInternalFieldCount(
-+        gin::kNumberOfInternalFields);
-     delete_method_ctor_template->Inherit(base_modifier_method_template);
-     delete_method_ctor_template->SetClassName(
-         v8_helper_->CreateStringFromLiteral(kSharedStorageDeleteMethodName));
-@@ -459,6 +465,8 @@ void SharedStorageBindings::AttachToContext(v8::Local<v8::Context> context) {
-         v8::FunctionTemplate::New(
-             v8_helper_->isolate(),
-             &SharedStorageBindings::ClearMethodConstructor, v8_this);
-+    clear_method_ctor_template->InstanceTemplate()->SetInternalFieldCount(
-+        gin::kNumberOfInternalFields);
-     clear_method_ctor_template->Inherit(base_modifier_method_template);
-     clear_method_ctor_template->SetClassName(
-         v8_helper_->CreateStringFromLiteral(kSharedStorageClearMethodName));
 diff --git a/gin/BUILD.gn b/gin/BUILD.gn
 index ed562a2d424f2c0eed81aa6300644f146b5cb17f..44f8c84563692364346afbd5041aaf4287d78bba 100644
 --- a/gin/BUILD.gn
@@ -100,10 +60,10 @@ index b07da3a191cd0424fe76ee762de091a9ec24d5a4..49ecd470ce29078418ccb490caa8cfde
  ObjectTemplateBuilder::ObjectTemplateBuilder(v8::Isolate* isolate,
                                               const char* type_name,
 diff --git a/gin/per_isolate_data.cc b/gin/per_isolate_data.cc
-index 884990426f13a6abca22a60dd8cc0685f8435b23..addef14ce7801a38bdbe25af6b3bbb968074f6bf 100644
+index ee5a798d22be4f471437f3c1ffb2a140c6d84a5f..9c0beb9b0a3b37699bcb3a1555bee3892b51b79c 100644
 --- a/gin/per_isolate_data.cc
 +++ b/gin/per_isolate_data.cc
-@@ -68,12 +68,39 @@ PerIsolateData* PerIsolateData::From(Isolate* isolate) {
+@@ -75,12 +75,39 @@ PerIsolateData* PerIsolateData::From(Isolate* isolate) {
    return static_cast<PerIsolateData*>(isolate->GetData(kEmbedderNativeGin));
  }
  
@@ -143,7 +103,7 @@ index 884990426f13a6abca22a60dd8cc0685f8435b23..addef14ce7801a38bdbe25af6b3bbb96
  v8::Local<v8::ObjectTemplate> PerIsolateData::GetObjectTemplate(
      const WrapperInfo* info) {
    ObjectTemplateMap::iterator it = object_templates_.find(info);
-@@ -83,6 +110,25 @@ v8::Local<v8::ObjectTemplate> PerIsolateData::GetObjectTemplate(
+@@ -90,6 +117,25 @@ v8::Local<v8::ObjectTemplate> PerIsolateData::GetObjectTemplate(
    return it->second.Get(isolate_);
  }
  
@@ -169,7 +129,7 @@ index 884990426f13a6abca22a60dd8cc0685f8435b23..addef14ce7801a38bdbe25af6b3bbb96
  void PerIsolateData::AddDisposeObserver(DisposeObserver* observer) {
    dispose_observers_.AddObserver(observer);
  }
-@@ -97,6 +143,12 @@ void PerIsolateData::NotifyBeforeDispose() {
+@@ -104,6 +150,12 @@ void PerIsolateData::NotifyBeforeDispose() {
    }
  }
  
@@ -260,7 +220,7 @@ index d2b2ce62dc6244b969283c983032c1922ef83e79..3b961ac57bccd14a2284e01a3b800d5f
    std::shared_ptr<V8ForegroundTaskRunnerBase> task_runner_;
    std::shared_ptr<V8ForegroundTaskRunnerBase> user_visible_task_runner_;
 diff --git a/gin/public/gin_embedders.h b/gin/public/gin_embedders.h
-index f32f7ce79f5a1f25bfb89b901d75968d1e55697d..523d156de44c6e297855571699ec7a389a82a8b8 100644
+index beb1b4282beeed69d169df20fae3a908748c7127..e870a2ca8762cbb1c174fd1d2aa2f8241a03f110 100644
 --- a/gin/public/gin_embedders.h
 +++ b/gin/public/gin_embedders.h
 @@ -25,9 +25,13 @@ enum GinEmbedder : uint16_t {
@@ -614,10 +574,10 @@ index 0cdc51cbe448a0027f2fa4404323ccd36199606e..913752216e8ce77e074a8bf91dca307d
      return nullptr;
    }
 diff --git a/third_party/blink/renderer/platform/bindings/wrapper_type_info.h b/third_party/blink/renderer/platform/bindings/wrapper_type_info.h
-index 0cd60fe33e87dd3200a7041b42ddb3ce76997d73..5a01c6ad7fa7aece5c3129721e524a548574bd23 100644
+index 9149b4978966d6f909ce84b2dda58e53c0fa56ac..df61887798a166428ad22fb006432969c400016d 100644
 --- a/third_party/blink/renderer/platform/bindings/wrapper_type_info.h
 +++ b/third_party/blink/renderer/platform/bindings/wrapper_type_info.h
-@@ -188,6 +188,15 @@ struct PLATFORM_EXPORT WrapperTypeInfo final
+@@ -194,6 +194,15 @@ struct PLATFORM_EXPORT WrapperTypeInfo final
          interface_template, bindings::V8InterfaceBridgeBase::FeatureSelector());
    }
  

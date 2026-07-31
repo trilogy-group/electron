@@ -86,6 +86,8 @@
   V(electron_browser_screen)              \
   V(electron_browser_system_preferences)  \
   V(electron_browser_base_window)         \
+  V(electron_browser_clipboard)           \
+  V(electron_browser_clipboard_item)      \
   V(electron_browser_tray)                \
   V(electron_browser_utility_process)     \
   V(electron_browser_view)                \
@@ -98,7 +100,6 @@
 
 #define ELECTRON_COMMON_BINDINGS(V)   \
   V(electron_common_asar)             \
-  V(electron_common_clipboard)        \
   V(electron_common_command_line)     \
   V(electron_common_crashpad_support) \
   V(electron_common_environment)      \
@@ -115,10 +116,18 @@
   V(electron_renderer_ipc)            \
   V(electron_renderer_web_frame)
 
-#define ELECTRON_UTILITY_BINDINGS(V)     \
-  V(electron_browser_event_emitter)      \
-  V(electron_browser_system_preferences) \
-  V(electron_common_net)                 \
+#if BUILDFLAG(ENABLE_PROMPT_API)
+#define ELECTRON_UTILITY_PROMPT_API_BINDINGS(V) \
+  V(electron_utility_local_ai_handler)
+#else
+#define ELECTRON_UTILITY_PROMPT_API_BINDINGS(V)
+#endif  // BUILDFLAG(ENABLE_PROMPT_API)
+
+#define ELECTRON_UTILITY_BINDINGS(V)      \
+  V(electron_browser_event_emitter)       \
+  V(electron_browser_system_preferences)  \
+  V(electron_common_net)                  \
+  ELECTRON_UTILITY_PROMPT_API_BINDINGS(V) \
   V(electron_utility_parent_port)
 
 #define ELECTRON_TESTING_BINDINGS(V) V(electron_common_testing)

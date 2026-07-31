@@ -20,10 +20,7 @@
 #include <utility>
 #include <vector>
 
-#include "base/containers/fixed_flat_set.h"
 #include "base/memory/raw_ref.h"
-#include "base/numerics/ranges.h"
-#include "base/strings/utf_string_conversions.h"
 #include "content/public/browser/desktop_media_id.h"
 #include "content/public/common/color_parser.h"
 #include "shell/browser/api/electron_api_system_preferences.h"
@@ -61,7 +58,6 @@
 #if BUILDFLAG(IS_LINUX)
 #include "base/notimplemented.h"
 #include "shell/browser/browser.h"
-#include "shell/browser/linux/unity_service.h"
 #include "shell/browser/linux/x11_util.h"
 #include "shell/browser/ui/electron_desktop_window_tree_host_linux.h"
 #include "shell/browser/ui/views/electron_frame_view_linux.h"
@@ -86,6 +82,9 @@
 #endif
 
 #elif BUILDFLAG(IS_WIN)
+#include "base/containers/fixed_flat_map.h"
+#include "base/containers/fixed_flat_set.h"
+#include "base/numerics/ranges.h"
 #include "base/win/win_util.h"
 #include "base/win/windows_version.h"
 #include "shell/browser/ui/views/win_frame_view.h"
@@ -272,6 +271,15 @@ NativeWindowViews::NativeWindowViews(const int32_t base_window_id,
   const int width = options.ValueOrDefault(options::kWidth, 800);
   const int height = options.ValueOrDefault(options::kHeight, 600);
   gfx::Rect bounds{0, 0, width, height};
+  // If an explicit position is provided, place the HWND on the target monitor
+  // at creation time. On Windows, DesktopWindowTreeHostWin::SetBoundsInDIP
+  // resolves the display from the bounds' DIP position (with a null window),
+  // so the very first DIP->pixel conversion picks up the correct per-monitor
+  // scale factor. Without this, the HWND is created at (0,0) using
+  // primary-monitor DPI and later repositioned, producing the
+  // secondary-creation deflation symptom.
+  if (int x, y; options.Get(options::kX, &x) && options.Get(options::kY, &y))
+    bounds.set_origin({x, y});
   widget_size_ = bounds.size();
 
   has_shadow_ = options.ValueOrDefault(options::kHasShadow, true);
@@ -593,6 +601,8 @@ void NativeWindowViews::Show() {
   if (is_modal() && NativeWindow::parent() && !widget()->IsVisible())
     static_cast<NativeWindowViews*>(parent())->IncrementChildModals();
 
+  FlushPendingDisplayMode();
+
   widget()->native_widget_private()->Show(GetRestoredState(), gfx::Rect());
 
   // explicitly focus the window
@@ -612,6 +622,8 @@ void NativeWindowViews::Show() {
 }
 
 void NativeWindowViews::ShowInactive() {
+  FlushPendingDisplayMode();
+
   widget()->ShowInactive();
 
   NotifyWindowShow();
@@ -1357,14 +1369,15 @@ bool NativeWindowViews::HasShadow() const {
 }
 
 void NativeWindowViews::SetOpacity(const double opacity) {
+  const double bounded_opacity =
+      std::isnan(opacity) ? 1.0 : std::clamp(opacity, 0.0, 1.0);
+  opacity_ = bounded_opacity;
 #if BUILDFLAG(IS_WIN)
-  const double boundedOpacity = std::clamp(opacity, 0.0, 1.0);
   HWND hwnd = GetAcceleratedWidget();
   SetLayered();
-  ::SetLayeredWindowAttributes(hwnd, 0, boundedOpacity * 255, LWA_ALPHA);
-  opacity_ = boundedOpacity;
-#else
-  opacity_ = 1.0;  // setOpacity unsupported on Linux
+  ::SetLayeredWindowAttributes(hwnd, 0, bounded_opacity * 255, LWA_ALPHA);
+#elif BUILDFLAG(IS_LINUX)
+  widget()->SetOpacity(static_cast<float>(bounded_opacity));
 #endif
 }
 
@@ -1579,10 +1592,6 @@ void NativeWindowViews::SetProgressBar(double progress,
                                        NativeWindow::ProgressState state) {
 #if BUILDFLAG(IS_WIN)
   taskbar_host_.SetProgressBar(GetAcceleratedWidget(), progress, state);
-#elif BUILDFLAG(IS_LINUX)
-  if (unity::IsRunning()) {
-    unity::SetProgressFraction(progress);
-  }
 #endif
 }
 

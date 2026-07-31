@@ -821,7 +821,7 @@ Returns `Promise<void>` - Resolves when all connections are closed.
 Returns `Promise<GlobalResponse>` - see [Response](https://developer.mozilla.org/en-US/docs/Web/API/Response).
 
 Sends a request, similarly to how `fetch()` works in the renderer, using
-Chrome's network stack. This differs from Node's `fetch()`, which uses
+Chromium's network stack. This differs from Node's `fetch()`, which uses
 Node.js's HTTP stack.
 
 Example:
@@ -1679,6 +1679,12 @@ This method clears more types of data and is more thorough than the
 > Clearing cache data will also clear the shared dictionary cache. This means that any dictionaries used for compression may be reloaded after clearing the cache. If you wish to clear the shared dictionary cache but leave other cached data intact, you may want to use the `clearSharedDictionaryCache` method.
 
 For more information, refer to Chromium's [`BrowsingDataRemover` interface][browsing-data-remover].
+
+#### `ses.registerLocalAIHandler(handler)` _Experimental_
+
+* `handler` [UtilityProcess](utility-process.md#class-utilityprocess) | null
+
+Registers a local AI handler `UtilityProcess`. To clear the handler, call `registerLocalAIHandler(null)`, which will disconnect any existing Prompt API sessions and destroy any `LanguageModelUtility` instances.
 
 ### Instance Properties
 

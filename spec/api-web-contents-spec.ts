@@ -1479,16 +1479,38 @@ describe('webContents module', () => {
       await waitUntil(() => w.webContents.devToolsWebContents!.executeJavaScript('typeof DevToolsAPI !== "undefined"'));
     }
 
+    // The DevTools frontend should route context menus through the native
+    // DevToolsHost binding rather than a JS override injected by Electron.
+    function usesNativeShowContextMenu(devtoolsContents: Electron.WebContents): Promise<boolean> {
+      return devtoolsContents.executeJavaScript(
+        'typeof DevToolsHost !== "undefined" && InspectorFrontendHost.showContextMenuAtPoint.toString().includes("DevToolsHost")'
+      );
+    }
+
+    // Triggers InspectorFrontendHost.showContextMenuAtPoint with an empty
+    // item list at a non-editable point. No menu UI is shown, but a correctly
+    // routed request still round-trips through the browser, which reports
+    // the menu closed back to the frontend as DevToolsAPI.contextMenuCleared.
+    // A request swallowed by the generic context-menu path never resolves.
+    function devToolsMenuRequestRoundTrips(devtoolsContents: Electron.WebContents): Promise<boolean> {
+      return devtoolsContents.executeJavaScript(`new Promise(resolve => {
+        const timeout = setTimeout(() => resolve(false), 5000);
+        const original = DevToolsAPI.contextMenuCleared.bind(DevToolsAPI);
+        DevToolsAPI.contextMenuCleared = () => {
+          clearTimeout(timeout);
+          DevToolsAPI.contextMenuCleared = original;
+          resolve(true);
+          original();
+        };
+        InspectorFrontendHost.showContextMenuAtPoint(10, 10, [], document);
+      })`);
+    }
+
     it('uses the native showContextMenuAtPoint implementation', async () => {
       const w = new BrowserWindow({ show: false });
       await openDevTools(w);
 
-      // The DevTools frontend should route context menus through the native
-      // DevToolsHost binding rather than a JS override injected by Electron.
-      const usesNativeContextMenu = await w.webContents.devToolsWebContents!.executeJavaScript(
-        'typeof DevToolsHost !== "undefined" && InspectorFrontendHost.showContextMenuAtPoint.toString().includes("DevToolsHost")'
-      );
-      expect(usesNativeContextMenu).to.be.true();
+      expect(await usesNativeShowContextMenu(w.webContents.devToolsWebContents!)).to.be.true();
     });
 
     it('uses the native window.confirm implementation', async () => {
@@ -1501,6 +1523,58 @@ describe('webContents module', () => {
         'window.confirm.toString().includes("[native code]")'
       );
       expect(confirmIsNative).to.be.true();
+    });
+
+    // Baseline for the setDevToolsWebContents() regression test below: the
+    // managed (built-in) DevTools route via InspectableWebContents.
+    it('routes context menu requests through the native menu path', async () => {
+      const w = new BrowserWindow({ show: false });
+      await openDevTools(w);
+
+      const roundTripped = await devToolsMenuRequestRoundTrips(w.webContents.devToolsWebContents!);
+      expect(roundTripped).to.be.true();
+    });
+
+    describe('with setDevToolsWebContents()', () => {
+      async function openCustomDevTools(w: BrowserWindow, devtools: BrowserWindow) {
+        await w.loadURL('about:blank');
+        w.webContents.setDevToolsWebContents(devtools.webContents);
+        const devtoolsReady = once(devtools.webContents, 'dom-ready');
+        w.webContents.openDevTools();
+        await devtoolsReady;
+        await waitUntil(() => devtools.webContents.executeJavaScript('typeof DevToolsAPI !== "undefined"'));
+        // The browser only delivers context-menu-closed notifications to a
+        // focused frame; focus the frontend like a user interacting with it.
+        devtools.webContents.focus();
+        await waitUntil(() => devtools.webContents.executeJavaScript('document.hasFocus()'));
+      }
+
+      it('uses the native showContextMenuAtPoint implementation', async () => {
+        const w = new BrowserWindow({ show: false });
+        const devtools = new BrowserWindow({ show: false });
+        await openCustomDevTools(w, devtools);
+
+        expect(await usesNativeShowContextMenu(devtools.webContents)).to.be.true();
+      });
+
+      // Regression test for https://github.com/electron/electron/issues/51962:
+      // a DevTools frontend hosted in a user-provided WebContents must show
+      // its popup menus via the native DevTools menu path rather than having
+      // the request swallowed by the generic 'context-menu' event plumbing.
+      it('routes context menu requests through the native menu path', async () => {
+        const w = new BrowserWindow({ show: false });
+        const devtools = new BrowserWindow({ show: false });
+        await openCustomDevTools(w, devtools);
+
+        let emittedContextMenu = false;
+        devtools.webContents.once('context-menu', () => {
+          emittedContextMenu = true;
+        });
+
+        const roundTripped = await devToolsMenuRequestRoundTrips(devtools.webContents);
+        expect(roundTripped).to.be.true();
+        expect(emittedContextMenu).to.be.false();
+      });
     });
   });
 
@@ -2501,6 +2575,510 @@ describe('webContents module', () => {
         zoomLevel = w.webContents.zoomLevel;
         expect(zoomLevel).to.equal(0);
       });
+    });
+  });
+
+  describe('zoom mode', () => {
+    afterEach(closeAllWindows);
+
+    it('defaults to "default" zoom mode', async () => {
+      const w = new BrowserWindow({ show: false });
+      await w.loadURL('about:blank');
+      expect(w.webContents.getZoomMode()).to.equal('default');
+    });
+
+    it('can get and set zoom mode via functions', async () => {
+      const w = new BrowserWindow({ show: false });
+      await w.loadURL('about:blank');
+
+      w.webContents.setZoomMode('isolated');
+      expect(w.webContents.getZoomMode()).to.equal('isolated');
+
+      w.webContents.setZoomMode('manual');
+      expect(w.webContents.getZoomMode()).to.equal('manual');
+
+      w.webContents.setZoomMode('disabled');
+      expect(w.webContents.getZoomMode()).to.equal('disabled');
+
+      w.webContents.setZoomMode('default');
+      expect(w.webContents.getZoomMode()).to.equal('default');
+    });
+
+    it('can get and set zoom mode via property', async () => {
+      const w = new BrowserWindow({ show: false });
+      await w.loadURL('about:blank');
+
+      w.webContents.zoomMode = 'isolated';
+      expect(w.webContents.zoomMode).to.equal('isolated');
+
+      w.webContents.zoomMode = 'default';
+      expect(w.webContents.zoomMode).to.equal('default');
+    });
+
+    it('throws on invalid zoom mode', async () => {
+      const w = new BrowserWindow({ show: false });
+      await w.loadURL('about:blank');
+
+      expect(() => {
+        w.webContents.setZoomMode('invalid' as any);
+      }).to.throw();
+    });
+
+    it('isolated mode prevents zoom propagation across same-origin tabs', async () => {
+      const w = new BrowserWindow({ show: false });
+      const w2 = new BrowserWindow({ show: false });
+
+      defer(() => {
+        w2.setClosable(true);
+        w2.close();
+      });
+
+      await w.loadURL('about:blank');
+      await w2.loadURL('about:blank');
+
+      w.webContents.setZoomMode('isolated');
+      w.webContents.setZoomLevel(2.0);
+
+      expect(w.webContents.getZoomLevel()).to.equal(2.0);
+      expect(w2.webContents.getZoomLevel()).to.not.equal(2.0);
+    });
+
+    it('disabled mode prevents zoom level changes', async () => {
+      const w = new BrowserWindow({ show: false });
+      await w.loadURL('about:blank');
+
+      w.webContents.setZoomMode('disabled');
+      const beforeLevel = w.webContents.getZoomLevel();
+      w.webContents.setZoomLevel(2.0);
+      expect(w.webContents.getZoomLevel()).to.equal(beforeLevel);
+    });
+
+    it('persists isolated mode across cross-document navigation', async () => {
+      const server = http.createServer((req, res) => {
+        res.end('hello');
+      });
+      const { url: serverUrl } = await listen(server);
+      defer(() => server.close());
+
+      const w = new BrowserWindow({ show: false });
+      await w.loadURL(serverUrl);
+
+      w.webContents.setZoomMode('isolated');
+      w.webContents.setZoomLevel(2.0);
+      expect(w.webContents.getZoomMode()).to.equal('isolated');
+
+      const crossSiteUrl = serverUrl.replace('127.0.0.1', 'localhost');
+      await w.loadURL(crossSiteUrl);
+      expect(w.webContents.getZoomMode()).to.equal('isolated');
+    });
+
+    it('resets isolated mode when switched back to default', async () => {
+      const w = new BrowserWindow({ show: false });
+      await w.loadURL('about:blank');
+
+      w.webContents.setZoomMode('isolated');
+      expect(w.webContents.getZoomMode()).to.equal('isolated');
+
+      w.webContents.setZoomMode('default');
+      expect(w.webContents.getZoomMode()).to.equal('default');
+    });
+
+    it('manual mode tracks zoom level without zooming the page', async () => {
+      const w = new BrowserWindow({ show: false });
+      await w.loadURL('about:blank');
+
+      w.webContents.setZoomMode('manual');
+      w.webContents.setZoomLevel(2.0);
+
+      // Controller reports the manually tracked level
+      expect(w.webContents.getZoomLevel()).to.equal(2.0);
+    });
+
+    it('preserves zoom level after navigation in isolated mode', async () => {
+      const server = http.createServer((req, res) => {
+        res.end('hello');
+      });
+      const { url: serverUrl } = await listen(server);
+      defer(() => server.close());
+
+      const w = new BrowserWindow({ show: false });
+      await w.loadURL(serverUrl);
+
+      w.webContents.setZoomMode('isolated');
+      w.webContents.setZoomLevel(2.0);
+
+      const crossSiteUrl = serverUrl.replace('127.0.0.1', 'localhost');
+      await w.loadURL(crossSiteUrl);
+
+      expect(w.webContents.getZoomMode()).to.equal('isolated');
+      expect(w.webContents.getZoomLevel()).to.equal(2.0);
+    });
+
+    it('transitions from disabled to isolated mode correctly', async () => {
+      const w = new BrowserWindow({ show: false });
+      await w.loadURL('about:blank');
+
+      // Start in disabled mode — zoom changes should be ignored
+      w.webContents.setZoomMode('disabled');
+      w.webContents.setZoomLevel(3.0);
+      expect(w.webContents.getZoomLevel()).to.equal(0);
+
+      // Transition to isolated mode (special code path: doesn't call
+      // SetTemporaryZoomLevel, manually fires observer event instead)
+      w.webContents.setZoomMode('isolated');
+      expect(w.webContents.getZoomMode()).to.equal('isolated');
+
+      // Zoom should now work in isolated mode
+      w.webContents.setZoomLevel(2.0);
+      expect(w.webContents.getZoomLevel()).to.equal(2.0);
+    });
+
+    it('isolated zoom does not leak to same-origin tabs after navigation', async () => {
+      const server = http.createServer((req, res) => {
+        res.end('hello');
+      });
+      const { url: serverUrl } = await listen(server);
+      defer(() => server.close());
+
+      const w = new BrowserWindow({ show: false });
+      const w2 = new BrowserWindow({ show: false });
+      defer(() => {
+        w2.setClosable(true);
+        w2.close();
+      });
+
+      // w2 loads the target origin first — reset any stale per-host zoom
+      await w2.loadURL(serverUrl);
+      w2.webContents.setZoomLevel(0);
+
+      // w starts on a different origin, sets isolated zoom
+      const crossSiteUrl = serverUrl.replace('127.0.0.1', 'localhost');
+      await w.loadURL(crossSiteUrl);
+      w.webContents.setZoomMode('isolated');
+      w.webContents.setZoomLevel(2.0);
+
+      // w navigates to the same origin as w2
+      await w.loadURL(serverUrl);
+
+      // w2 should remain unaffected
+      expect(w.webContents.getZoomLevel()).to.equal(2.0);
+      expect(w2.webContents.getZoomLevel()).to.equal(0);
+    });
+
+    it('can set zoom mode via webPreferences', async () => {
+      const w = new BrowserWindow({
+        show: false,
+        webPreferences: {
+          zoomMode: 'isolated'
+        }
+      });
+      await w.loadURL('about:blank');
+      expect(w.webContents.getZoomMode()).to.equal('isolated');
+    });
+
+    it('webPreferences zoomMode isolated prevents cross-tab zoom', async () => {
+      const w = new BrowserWindow({
+        show: false,
+        webPreferences: {
+          zoomMode: 'isolated'
+        }
+      });
+      const w2 = new BrowserWindow({ show: false });
+      defer(() => {
+        w2.setClosable(true);
+        w2.close();
+      });
+
+      await w.loadURL('about:blank');
+      await w2.loadURL('about:blank');
+
+      w.webContents.setZoomLevel(2.0);
+      expect(w.webContents.getZoomLevel()).to.equal(2.0);
+      expect(w2.webContents.getZoomLevel()).to.not.equal(2.0);
+    });
+
+    it('webPreferences zoomMode disabled prevents zoom changes', async () => {
+      const w = new BrowserWindow({
+        show: false,
+        webPreferences: {
+          zoomMode: 'disabled'
+        }
+      });
+      await w.loadURL('about:blank');
+
+      expect(w.webContents.getZoomMode()).to.equal('disabled');
+      w.webContents.setZoomLevel(2.0);
+      expect(w.webContents.getZoomLevel()).to.equal(0);
+    });
+
+    it('default mode shares zoom across same-origin tabs', async () => {
+      const w = new BrowserWindow({ show: false });
+      const w2 = new BrowserWindow({ show: false });
+      defer(() => {
+        w2.setClosable(true);
+        w2.close();
+      });
+
+      await w.loadURL('about:blank');
+      await w2.loadURL('about:blank');
+
+      try {
+        // Both in default mode — zoom should propagate per-domain
+        w.webContents.setZoomLevel(2.0);
+        expect(w2.webContents.getZoomLevel()).to.equal(2.0);
+      } finally {
+        // Reset per-host zoom in HostZoomMap to avoid leaking to other tests
+        w.webContents.setZoomLevel(0);
+      }
+    });
+
+    it('switching from isolated to default re-joins per-domain zoom', async () => {
+      const server = http.createServer((req, res) => {
+        res.end('hello');
+      });
+      const { url: serverUrl } = await listen(server);
+      defer(() => server.close());
+
+      const w = new BrowserWindow({ show: false });
+      const w2 = new BrowserWindow({ show: false });
+      defer(() => {
+        w2.setClosable(true);
+        w2.close();
+      });
+
+      await w.loadURL(serverUrl);
+      await w2.loadURL(serverUrl);
+      // Reset any stale per-host zoom from previous tests
+      w.webContents.setZoomLevel(0);
+
+      try {
+        // Isolated: w's zoom should NOT affect w2
+        w.webContents.setZoomMode('isolated');
+        w.webContents.setZoomLevel(2.0);
+        expect(w2.webContents.getZoomLevel()).to.equal(0);
+
+        // Switch back to default: w's zoom should now affect w2
+        w.webContents.setZoomMode('default');
+        w.webContents.setZoomLevel(3.0);
+        expect(w2.webContents.getZoomLevel()).to.equal(3.0);
+      } finally {
+        // Reset per-host zoom in HostZoomMap to avoid leaking to other tests
+        w.webContents.setZoomLevel(0);
+      }
+    });
+
+    it('webPreferences zoomMode isolated persists across navigation', async () => {
+      const server = http.createServer((req, res) => {
+        res.end('hello');
+      });
+      const { url: serverUrl } = await listen(server);
+      defer(() => server.close());
+
+      const w = new BrowserWindow({
+        show: false,
+        webPreferences: {
+          zoomMode: 'isolated'
+        }
+      });
+      await w.loadURL(serverUrl);
+      w.webContents.setZoomLevel(2.0);
+
+      const crossSiteUrl = serverUrl.replace('127.0.0.1', 'localhost');
+      await w.loadURL(crossSiteUrl);
+
+      expect(w.webContents.getZoomMode()).to.equal('isolated');
+      expect(w.webContents.getZoomLevel()).to.equal(2.0);
+    });
+
+    it('preserves zoomMode and zoomLevel after reload', async () => {
+      const server = http.createServer((req, res) => {
+        res.end('hello');
+      });
+      const { url: serverUrl } = await listen(server);
+      defer(() => server.close());
+
+      const w = new BrowserWindow({ show: false });
+      await w.loadURL(serverUrl);
+
+      w.webContents.setZoomMode('isolated');
+      w.webContents.setZoomLevel(2.0);
+
+      // Reload the page
+      const reloadPromise = once(w.webContents, 'did-finish-load');
+      w.webContents.reload();
+      await reloadPromise;
+
+      expect(w.webContents.getZoomMode()).to.equal('isolated');
+      expect(w.webContents.getZoomLevel()).to.equal(2.0);
+    });
+
+    it('isolated mode with webPreferences.zoomFactor preserves zoom after navigation', async () => {
+      const server = http.createServer((req, res) => {
+        res.end('hello');
+      });
+      const { url: serverUrl } = await listen(server);
+      defer(() => server.close());
+
+      const w = new BrowserWindow({
+        show: false,
+        webPreferences: {
+          zoomMode: 'isolated',
+          zoomFactor: 1.5
+        }
+      });
+      await w.loadURL(serverUrl);
+      w.webContents.setZoomLevel(2.0);
+
+      // Navigate cross-site — the zoomFactor must NOT override our isolated zoom
+      const crossSiteUrl = serverUrl.replace('127.0.0.1', 'localhost');
+      await w.loadURL(crossSiteUrl);
+
+      expect(w.webContents.getZoomMode()).to.equal('isolated');
+      expect(w.webContents.getZoomLevel()).to.equal(2.0);
+    });
+
+    it('preserves zoomMode and zoomLevel after same-origin navigation', async () => {
+      const server = http.createServer((req, res) => {
+        res.end('hello');
+      });
+      const { url: serverUrl } = await listen(server);
+      defer(() => server.close());
+
+      const w = new BrowserWindow({ show: false });
+      await w.loadURL(serverUrl);
+
+      w.webContents.setZoomMode('isolated');
+      w.webContents.setZoomLevel(2.0);
+
+      // Navigate to a different path on the same origin
+      await w.loadURL(serverUrl + '/other-page');
+
+      expect(w.webContents.getZoomMode()).to.equal('isolated');
+      expect(w.webContents.getZoomLevel()).to.equal(2.0);
+    });
+
+    it('webPreferences zoomFactor is applied as initial zoom in isolated mode', async () => {
+      const server = http.createServer((req, res) => {
+        res.end('hello');
+      });
+      const { url: serverUrl } = await listen(server);
+      defer(() => server.close());
+
+      const w = new BrowserWindow({
+        show: false,
+        webPreferences: {
+          zoomMode: 'isolated',
+          zoomFactor: 1.5
+        }
+      });
+      await w.loadURL(serverUrl);
+
+      // The zoomFactor should be applied as the initial zoom level
+      expect(w.webContents.getZoomMode()).to.equal('isolated');
+      const zoomFactor = w.webContents.getZoomFactor();
+      expect(zoomFactor).to.be.closeTo(1.5, 0.05);
+    });
+
+    it('rapid mode switching does not crash', async () => {
+      const w = new BrowserWindow({ show: false });
+      await w.loadURL('about:blank');
+
+      // Rapidly switch between all modes
+      w.webContents.setZoomMode('isolated');
+      w.webContents.setZoomMode('manual');
+      w.webContents.setZoomMode('disabled');
+      w.webContents.setZoomMode('default');
+      w.webContents.setZoomMode('isolated');
+      w.webContents.setZoomMode('default');
+
+      expect(w.webContents.getZoomMode()).to.equal('default');
+    });
+
+    it('mode transitions preserve expected zoom behavior', async () => {
+      const w = new BrowserWindow({ show: false });
+      await w.loadURL('about:blank');
+
+      // disabled -> isolated -> manual -> default
+      w.webContents.setZoomMode('disabled');
+      w.webContents.setZoomLevel(3.0);
+      expect(w.webContents.getZoomLevel()).to.equal(0); // disabled ignores zoom
+
+      w.webContents.setZoomMode('isolated');
+      w.webContents.setZoomLevel(2.0);
+      expect(w.webContents.getZoomLevel()).to.equal(2.0); // isolated works
+
+      w.webContents.setZoomMode('manual');
+      w.webContents.setZoomLevel(1.5);
+      expect(w.webContents.getZoomLevel()).to.equal(1.5); // manual tracks level
+
+      w.webContents.setZoomMode('default');
+      // After switching to default, zoom should be at the per-domain level
+      expect(w.webContents.getZoomMode()).to.equal('default');
+      // Reset per-host zoom in HostZoomMap to avoid leaking to other tests
+      w.webContents.setZoomLevel(0);
+    });
+
+    it('isolated mode does not share zoom across different sessions', async () => {
+      const w = new BrowserWindow({ show: false });
+      const w2 = new BrowserWindow({
+        show: false,
+        webPreferences: { partition: 'zoom-test-partition' }
+      });
+      defer(() => {
+        w2.setClosable(true);
+        w2.close();
+      });
+
+      await w.loadURL('about:blank');
+      await w2.loadURL('about:blank');
+
+      w.webContents.setZoomMode('isolated');
+      w.webContents.setZoomLevel(2.0);
+
+      // Different session — should never share zoom regardless of mode
+      expect(w2.webContents.getZoomLevel()).to.equal(0);
+    });
+
+    it('setZoomLevel and setZoomFactor are consistent in isolated mode', async () => {
+      const w = new BrowserWindow({ show: false });
+      await w.loadURL('about:blank');
+
+      w.webContents.setZoomMode('isolated');
+
+      // Set via setZoomFactor, read via getZoomLevel
+      w.webContents.setZoomFactor(1.5);
+      const levelFromFactor = w.webContents.getZoomLevel();
+      expect(levelFromFactor).to.not.equal(0);
+
+      // Set via setZoomLevel, read via getZoomFactor
+      w.webContents.setZoomLevel(0);
+      const factorFromLevel = w.webContents.getZoomFactor();
+      expect(factorFromLevel).to.be.closeTo(1.0, 0.05);
+    });
+
+    it('isolated mode works correctly after error page navigation', async () => {
+      const server = http.createServer((req, res) => {
+        res.end('hello');
+      });
+      const { url: serverUrl } = await listen(server);
+      defer(() => server.close());
+
+      const w = new BrowserWindow({ show: false });
+      await w.loadURL(serverUrl);
+
+      w.webContents.setZoomMode('isolated');
+      w.webContents.setZoomLevel(2.0);
+
+      // Navigate to an error page
+      await w.loadURL('http://localhost:1/nonexistent').catch(() => {});
+
+      // Mode should still be isolated
+      expect(w.webContents.getZoomMode()).to.equal('isolated');
+
+      // Navigate back to a valid page
+      await w.loadURL(serverUrl);
+      expect(w.webContents.getZoomMode()).to.equal('isolated');
+      expect(w.webContents.getZoomLevel()).to.equal(2.0);
     });
   });
 

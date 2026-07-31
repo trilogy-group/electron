@@ -9,7 +9,6 @@
 #include <optional>
 #include <utility>
 
-#include "base/functional/callback_helpers.h"
 #include "base/location.h"
 #include "base/memory/ptr_util.h"
 #include "base/memory/raw_ptr.h"
@@ -193,7 +192,7 @@ OffScreenRenderWidgetHostView::OffScreenRenderWidgetHostView(
   compositor_allocator_.GenerateId();
   compositor_surface_id_ = compositor_allocator_.GetCurrentLocalSurfaceId();
 
-  root_layer_ = std::make_unique<ui::Layer>(ui::LAYER_SOLID_COLOR);
+  root_layer_ = std::make_unique<ui::LayerSolidColor>();
 
   root_layer()->SetColor(background_color_);
 
@@ -352,11 +351,6 @@ bool OffScreenRenderWidgetHostView::IsShowing() {
   return is_showing_;
 }
 
-void OffScreenRenderWidgetHostView::EnsureSurfaceSynchronizedForWebTest() {
-  ++latest_capture_sequence_number_;
-  SynchronizeVisualProperties();
-}
-
 gfx::Rect OffScreenRenderWidgetHostView::GetViewBounds() {
   if (IsPopupWidget())
     return popup_position_;
@@ -479,10 +473,6 @@ void OffScreenRenderWidgetHostView::Destroy() {
   delete this;
 }
 
-uint32_t OffScreenRenderWidgetHostView::GetCaptureSequenceNumber() const {
-  return latest_capture_sequence_number_;
-}
-
 void OffScreenRenderWidgetHostView::CopyFromSurface(
     const gfx::Rect& src_rect,
     const gfx::Size& output_size,
@@ -492,7 +482,7 @@ void OffScreenRenderWidgetHostView::CopyFromSurface(
       src_rect, output_size, base::TimeDelta(), std::move(callback));
 }
 
-gfx::Rect OffScreenRenderWidgetHostView::GetBoundsInRootWindow() {
+gfx::Rect OffScreenRenderWidgetHostView::GetBoundsInScreen() {
   return gfx::Rect(size_);
 }
 

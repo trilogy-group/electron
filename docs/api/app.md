@@ -326,7 +326,7 @@ app.on('certificate-error', (event, webContents, url, error, certificate, callba
 Returns:
 
 * `event` Event
-* `webContents` [WebContents](web-contents.md)
+* `webContents` [WebContents](web-contents.md) (optional)
 * `url` URL
 * `certificateList` [Certificate[]](structures/certificate.md)
 * `callback` Function
@@ -338,6 +338,14 @@ The `url` corresponds to the navigation entry requesting the client certificate
 and `callback` can be called with an entry filtered from the list. Using
 `event.preventDefault()` prevents the application from using the first
 certificate from the store.
+
+`webContents` is `null` when the request does not originate from a renderer
+process, for example when using [`net.request`](net.md#netrequestoptions) or
+[`net.fetch`](net.md#netfetchinput-init) in the main process, or from a
+[utility process](utility-process.md) created with
+`respondToAuthRequestsFromMainProcess: true`. For utility processes created
+without that flag, `net` requests proceed without a client certificate and this
+event is not emitted.
 
 ```js
 const { app } = require('electron')
@@ -357,6 +365,9 @@ Returns:
 * `authenticationResponseDetails` Object
   * `url` URL
   * `pid` number
+  * `isRequestForNavigation` boolean - Indicates whether the request is for a navigation.
+  * `firstAuthAttempt` boolean - Indicates whether this is the first authentication attempt.
+  * `responseHeaders` Record\<string, string | string[]\> (optional) - The headers returned in the response.
 * `authInfo` Object
   * `isProxy` boolean
   * `scheme` string
@@ -438,10 +449,10 @@ because it was crashed or killed. It does not include renderer processes.
 Returns:
 
 * `event` Event
-* `accessibilitySupportEnabled` boolean - `true` when Chrome's accessibility
+* `accessibilitySupportEnabled` boolean - `true` when Chromium's accessibility
   support is enabled, `false` otherwise.
 
-Emitted when Chrome's accessibility support changes. This event fires when
+Emitted when Chromium's accessibility support changes. This event fires when
 assistive technologies, such as screen readers, are enabled or disabled.
 See https://www.chromium.org/developers/design-documents/accessibility for more
 details.
@@ -1375,32 +1386,22 @@ Using `basic` should be preferred if only basic information like `vendorId` or `
 
 Promise is rejected if the GPU is completely disabled, i.e. no hardware and software implementations are available.
 
-### `app.setBadgeCount([count])` _Linux_ _macOS_
+### `app.setBadgeCount([count])` _macOS_
 
-* `count` Integer (optional) - If a value is provided, set the badge to the provided value otherwise, on macOS, display a plain white dot (e.g. unknown number of notifications). On Linux, if a value is not provided the badge will not display.
+* `count` Integer (optional) - If a value is provided, set the badge to the provided value otherwise, on macOS, display a plain white dot (e.g. unknown number of notifications).
 
 Returns `boolean` - Whether the call succeeded.
 
-Sets the counter badge for current app. Setting the count to `0` will hide the
+Sets the Dock icon counter badge for current app. Setting the count to `0` will hide the
 badge.
 
-On macOS, it shows on the dock icon. On Linux, it only works for Unity launcher.
-
 > [!NOTE]
-> Unity launcher requires a `.desktop` file to work. For more information,
-> please read the [Unity integration documentation][unity-requirement].
-
-> [!NOTE]
-> On macOS, you need to ensure that your application has the permission
+> You need to ensure that your application has the permission
 > to display notifications for this method to work.
 
-### `app.getBadgeCount()` _Linux_ _macOS_
+### `app.getBadgeCount()` _macOS_
 
 Returns `Integer` - The current value displayed in the counter badge.
-
-### `app.isUnityRunning()` _Linux_
-
-Returns `boolean` - Whether the current desktop environment is Unity launcher.
 
 ### `app.getLoginItemSettings([options])` _macOS_ _Windows_
 
@@ -1480,7 +1481,7 @@ For more information about setting different services as login items on macOS 13
 
 ### `app.isAccessibilitySupportEnabled()` _macOS_ _Windows_
 
-Returns `boolean` - `true` if Chrome's accessibility support is enabled,
+Returns `boolean` - `true` if Chromium's accessibility support is enabled,
 `false` otherwise. This API will return `true` if the use of assistive
 technologies, such as screen readers, has been detected. See
 https://www.chromium.org/developers/design-documents/accessibility for more
@@ -1490,7 +1491,7 @@ details.
 
 * `enabled` boolean - Enable or disable [accessibility tree](https://developers.google.com/web/fundamentals/accessibility/semantics-builtin/the-accessibility-tree) rendering
 
-Manually enables Chrome's accessibility support, allowing to expose accessibility switch to users in application settings. See [Chromium's accessibility docs](https://www.chromium.org/developers/design-documents/accessibility) for more
+Manually enables Chromium's accessibility support, allowing to expose accessibility switch to users in application settings. See [Chromium's accessibility docs](https://www.chromium.org/developers/design-documents/accessibility) for more
 details. Disabled by default.
 
 This API must be called after the `ready` event is emitted.
@@ -1750,7 +1751,7 @@ app.setClientCertRequestPasswordHandler(async ({ hostname, tokenName, isRetry })
 
 ### `app.accessibilitySupportEnabled` _macOS_ _Windows_
 
-A `boolean` property that's `true` if Chrome's accessibility support is enabled, `false` otherwise. This property will be `true` if the use of assistive technologies, such as screen readers, has been detected. Setting this property to `true` manually enables Chrome's accessibility support, allowing developers to expose accessibility switch to users in application settings.
+A `boolean` property that's `true` if Chromium's accessibility support is enabled, `false` otherwise. This property will be `true` if the use of assistive technologies, such as screen readers, has been detected. Setting this property to `true` manually enables Chromium's accessibility support, allowing developers to expose accessibility switch to users in application settings.
 
 See [Chromium's accessibility docs](https://www.chromium.org/developers/design-documents/accessibility) for more details. Disabled by default.
 
@@ -1764,18 +1765,12 @@ This API must be called after the `ready` event is emitted.
 A `Menu | null` property that returns [`Menu`](menu.md) if one has been set and `null` otherwise.
 Users can pass a [Menu](menu.md) to set this property.
 
-### `app.badgeCount` _Linux_ _macOS_
+### `app.badgeCount` _macOS_
 
-An `Integer` property that returns the badge count for current app. Setting the count to `0` will hide the badge.
-
-On macOS, setting this with any nonzero integer shows on the dock icon. On Linux, this property only works for Unity launcher.
+An `Integer` property that returns the badge count for current app. Setting the count to `0` will hide the badge. Setting this with any nonzero integer shows the count on the Dock icon.
 
 > [!NOTE]
-> Unity launcher requires a `.desktop` file to work. For more information,
-> please read the [Unity integration documentation][unity-requirement].
-
-> [!NOTE]
-> On macOS, you need to ensure that your application has the permission
+> You need to ensure that your application has the permission
 > to display notifications for this property to take effect.
 
 ### `app.commandLine` _Readonly_
@@ -1805,7 +1800,6 @@ A `string` property that returns the app's [Toast Activator CLSID][toast-activat
 [LSCopyDefaultHandlerForURLScheme]: https://developer.apple.com/documentation/coreservices/1441725-lscopydefaulthandlerforurlscheme?language=objc
 [handoff]: https://developer.apple.com/library/ios/documentation/UserExperience/Conceptual/Handoff/HandoffFundamentals/HandoffFundamentals.html
 [activity-type]: https://developer.apple.com/library/ios/documentation/Foundation/Reference/NSUserActivity_Class/index.html#//apple_ref/occ/instp/NSUserActivity/activityType
-[unity-requirement]: https://help.ubuntu.com/community/UnityLaunchersAndDesktopFiles#Adding_shortcuts_to_a_launcher
 [mas-builds]: ../tutorial/mac-app-store-submission-guide.md
 [Squirrel-Windows]: https://github.com/Squirrel/Squirrel.Windows
 [JumpListBeginListMSDN]: https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-icustomdestinationlist-beginlist

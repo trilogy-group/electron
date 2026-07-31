@@ -8,13 +8,11 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <vector>
 
 #include "base/containers/flat_map.h"
 #include "base/containers/flat_set.h"
 #include "base/memory/raw_ptr.h"
-#include "base/synchronization/lock.h"
 #include "content/public/browser/content_browser_client.h"
 #include "content/public/browser/frame_tree_node_id.h"
 #include "content/public/browser/render_process_host_observer.h"
@@ -141,6 +139,18 @@ class ElectronBrowserClient : public content::ContentBrowserClient,
 
   content::PlatformNotificationService* GetPlatformNotificationService();
 
+  // content::ContentBrowserClient overrides exposed for net-module client
+  // certificate handling (see ClientCertificateResponderDelegate).
+  base::OnceClosure SelectClientCertificate(
+      content::BrowserContext* browser_context,
+      int process_id,
+      content::WebContents* web_contents,
+      net::SSLCertRequestInfo* cert_request_info,
+      net::ClientCertIdentityList client_certs,
+      std::unique_ptr<content::ClientCertificateDelegate> delegate) override;
+  std::unique_ptr<net::ClientCertStore> CreateClientCertStore(
+      content::BrowserContext* browser_context) override;
+
  protected:
   void RenderProcessWillLaunch(content::RenderProcessHost* host) override;
   content::SpeechRecognitionManagerDelegate*
@@ -170,13 +180,6 @@ class ElectronBrowserClient : public content::ContentBrowserClient,
       bool strict_enforcement,
       base::OnceCallback<void(content::CertificateRequestResultType)> callback)
       override;
-  base::OnceClosure SelectClientCertificate(
-      content::BrowserContext* browser_context,
-      int process_id,
-      content::WebContents* web_contents,
-      net::SSLCertRequestInfo* cert_request_info,
-      net::ClientCertIdentityList client_certs,
-      std::unique_ptr<content::ClientCertificateDelegate> delegate) override;
   bool CanCreateWindow(content::RenderFrameHost* opener,
                        const GURL& opener_url,
                        const GURL& opener_top_level_frame_url,
@@ -205,8 +208,6 @@ class ElectronBrowserClient : public content::ContentBrowserClient,
       std::vector<std::string>* additional_schemes) override;
   void GetAdditionalWebUISchemes(
       std::vector<std::string>* additional_schemes) override;
-  std::unique_ptr<net::ClientCertStore> CreateClientCertStore(
-      content::BrowserContext* browser_context) override;
   std::unique_ptr<device::LocationProvider> OverrideSystemLocationProvider()
       override;
   void ConfigureNetworkContextParams(
@@ -254,7 +255,8 @@ class ElectronBrowserClient : public content::ContentBrowserClient,
       const net::SiteForCookies& site_for_cookies,
       const std::optional<std::string>& user_agent,
       mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
-          handshake_client) override;
+          handshake_client,
+      WebSocketOptions options) override;
   bool WillInterceptWebSocket(content::RenderFrameHost*) override;
   void WillCreateURLLoaderFactory(
       content::BrowserContext* browser_context,
@@ -297,6 +299,14 @@ class ElectronBrowserClient : public content::ContentBrowserClient,
       const content::ServiceWorkerVersionBaseInfo& service_worker_version_info,
       blink::AssociatedInterfaceRegistry& associated_registry) override;
 
+#if BUILDFLAG(ENABLE_PROMPT_API)
+  void BindAIManager(
+      content::BrowserContext* browser_context,
+      base::SupportsUserData* context_user_data,
+      content::RenderFrameHost* rfh,
+      mojo::PendingReceiver<blink::mojom::AIManager> receiver) override;
+#endif  // BUILDFLAG(ENABLE_PROMPT_API)
+
   bool HandleExternalProtocol(
       const GURL& url,
       content::WebContents::Getter web_contents_getter,
@@ -337,10 +347,12 @@ class ElectronBrowserClient : public content::ContentBrowserClient,
       std::optional<int64_t> navigation_id) override;
   base::flat_set<std::string> GetPluginMimeTypesWithExternalHandlers(
       content::BrowserContext* browser_context) override;
-  bool IsSuitableHost(content::RenderProcessHost* process_host,
-                      const GURL& site_url) override;
-  bool ShouldUseProcessPerSite(content::BrowserContext* browser_context,
-                               const GURL& effective_url) override;
+  bool IsSuitableHost(
+      content::RenderProcessHost* process_host,
+      const content::SecurityPrincipal& security_principal) override;
+  bool ShouldUseProcessPerSite(
+      content::BrowserContext* browser_context,
+      const content::SecurityPrincipal& security_principal) override;
   void GetMediaDeviceIDSalt(
       content::RenderFrameHost* rfh,
       const net::SiteForCookies& site_for_cookies,

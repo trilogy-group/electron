@@ -42,6 +42,7 @@
 #include "shell/common/gin_helper/constructible.h"
 #include "shell/common/gin_helper/pinnable.h"
 #include "shell/common/gin_helper/wrappable.h"
+#include "third_party/skia/include/core/SkRegion.h"
 #include "ui/base/models/image_model.h"
 #include "v8/include/cppgc/persistent.h"
 
@@ -95,10 +96,10 @@ class Cursor;
 }
 
 class DevToolsEyeDropper;
-class SkRegion;
 
 namespace electron {
 
+class DevToolsContextMenu;
 class ElectronBrowserContext;
 class InspectableWebContents;
 class WebContentsZoomController;
@@ -336,6 +337,8 @@ class WebContents final : public ExclusiveAccessContext,
   double GetZoomLevel() const;
   void SetZoomFactor(gin_helper::ErrorThrower thrower, double factor);
   double GetZoomFactor() const;
+  void SetZoomMode(gin_helper::ErrorThrower thrower, const std::string& mode);
+  std::string GetZoomMode() const;
 
   // Callback triggered on permission response.
   void OnEnterFullscreenModeForTab(
@@ -647,9 +650,9 @@ class WebContents final : public ExclusiveAccessContext,
   void NavigationEntryCommitted(
       const content::LoadCommittedDetails& load_details) override;
   void TitleWasSet(content::NavigationEntry* entry) override;
-  void DidUpdateFaviconURL(
-      content::RenderFrameHost* render_frame_host,
-      const std::vector<blink::mojom::FaviconURLPtr>& urls) override;
+  void DidUpdateFaviconURL(content::RenderFrameHost* render_frame_host,
+                           const std::vector<blink::mojom::FaviconURLPtr>& urls,
+                           blink::mojom::FaviconUpdateReason reason) override;
   void MediaStartedPlaying(const MediaPlayerInfo& video_type,
                            const content::MediaPlayerId& id) override;
   void MediaStoppedPlaying(
@@ -870,6 +873,10 @@ class WebContents final : public ExclusiveAccessContext,
   // destroyed before dialog_manager_, otherwise a crash would happen.
   std::unique_ptr<InspectableWebContents> inspectable_web_contents_;
 
+  // Menu for context menu requests coming from a DevTools frontend hosted
+  // directly in this WebContents (e.g. via setDevToolsWebContents()).
+  std::unique_ptr<DevToolsContextMenu> devtools_context_menu_;
+
   std::optional<GURL> pending_unload_url_ = std::nullopt;
 
   // Maps url to file path, used by the file requests sent from devtools.
@@ -901,7 +908,7 @@ class WebContents final : public ExclusiveAccessContext,
   // Stores the frame that's currently in fullscreen, nullptr if there is none.
   raw_ptr<content::RenderFrameHost> fullscreen_frame_ = nullptr;
 
-  std::unique_ptr<SkRegion> draggable_region_;
+  std::optional<SkRegion> draggable_region_;
 
   base::WeakPtrFactory<WebContents> weak_factory_{this};
 };

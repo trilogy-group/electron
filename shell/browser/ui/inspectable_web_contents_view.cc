@@ -9,7 +9,6 @@
 #include <utility>
 
 #include "base/memory/raw_ptr.h"
-#include "base/strings/utf_string_conversions.h"
 #include "content/public/browser/web_contents.h"
 #include "shell/browser/ui/devtools_context_menu.h"
 #include "shell/browser/ui/drag_util.h"
@@ -19,6 +18,7 @@
 #include "ui/base/models/image_model.h"
 #include "ui/compositor/layer.h"
 #include "ui/views/controls/label.h"
+#include "ui/views/controls/native/native_view_host.h"
 #include "ui/views/controls/webview/webview.h"
 #include "ui/views/widget/widget.h"
 #include "ui/views/widget/widget_delegate.h"
@@ -95,6 +95,17 @@ InspectableWebContentsView::InspectableWebContentsView(
   if (!inspectable_web_contents_->is_guest() &&
       inspectable_web_contents_->GetWebContents()->GetNativeView()) {
     auto* contents_web_view = new views::WebView(nullptr);
+#if defined(USE_AURA)
+    // Chromium's NativeViewHostAura defaults to managing the hosted native
+    // view's layer via views crrev.com/c/8013273. Under that
+    // path the web contents' aura window layer is reparented out of its aura
+    // parent window's layer, which breaks occlusion-based visibility tracking
+    // (document.visibilityState) for WebContentsViews nested inside another
+    // View. Opt back into the legacy parent-managed layer path so occlusion is
+    // computed correctly. This must run before the WebView is attached to a
+    // Widget.
+    contents_web_view->holder()->SetLayerManagedByViews(false);
+#endif
     contents_web_view->SetWebContents(
         inspectable_web_contents_->GetWebContents());
     contents_web_view_ = contents_web_view;
@@ -124,7 +135,7 @@ void InspectableWebContentsView::SetCornerRadii(
     const gfx::RoundedCornersF& corner_radii) {
   // WebView won't exist for offscreen rendering.
   if (contents_web_view_) {
-    contents_web_view_->holder()->SetCornerRadii(corner_radii);
+    contents_web_view_->holder()->SetNativeViewCornerRadii(corner_radii);
 
 #if defined(USE_AURA)
     // Aura calls SetIsFastRoundedCorner(true) which clips each tile separately.
@@ -279,8 +290,6 @@ void InspectableWebContentsView::ShowDevToolsContextMenu(
   // that opening it doesn't shift focus to the inspected page's window.
   views::Widget* widget =
       devtools_window_ ? devtools_window_.get() : GetWidget();
-  if (!widget)
-    return;
 
   context_menu_ =
       std::make_unique<DevToolsContextMenu>(devtools_web_contents, params);

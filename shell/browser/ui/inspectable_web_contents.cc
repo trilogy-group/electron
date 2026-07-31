@@ -17,7 +17,6 @@
 #include "base/containers/span.h"
 #include "base/dcheck_is_on.h"
 #include "base/memory/raw_ptr.h"
-#include "base/metrics/histogram.h"
 #include "base/strings/pattern.h"
 #include "base/strings/string_util.h"
 #include "base/strings/utf_string_conversions.h"
@@ -677,7 +676,8 @@ void InspectableWebContents::AddDevToolsExtensionsToClient() {
 
 void InspectableWebContents::SetInspectedPageBounds(const gfx::Rect& rect) {
   if (managed_devtools_web_contents_)
-    view_->SetContentsResizingStrategy(DevToolsContentsResizingStrategy{rect});
+    view_->SetContentsResizingStrategy(
+        DevToolsContentsResizingStrategy{devtools::DockSide::kNone, rect});
 }
 
 void InspectableWebContents::InspectedURLChanged(const std::string& url) {

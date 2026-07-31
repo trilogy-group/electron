@@ -5,9 +5,7 @@
 #include "shell/renderer/electron_sandboxed_renderer_client.h"
 
 #include <iterator>
-#include <vector>
 
-#include "base/base_paths.h"
 #include "base/command_line.h"
 #include "base/process/process_metrics.h"
 #include "content/public/renderer/render_frame.h"

@@ -8,11 +8,11 @@ such as the background turning black when maximizing the window and
 dynamic background material settings not taking effect.
 
 diff --git a/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc b/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc
-index 16237d29c8fb1ac0c7ea8a8db5f5b619cd463b30..72281fcf10313c405fc784171a25c5942ea43b48 100644
+index 1c57c5f418d952965b8c89c2ce56ff18080098aa..2a36a26042c93cf6774180af7717c08ec7cbe5e9 100644
 --- a/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc
 +++ b/ui/views/widget/desktop_aura/desktop_window_tree_host_win.cc
-@@ -180,6 +180,10 @@ bool DesktopWindowTreeHostWin::IsInNativeMoveResizeLoop() const {
-   return message_handler_ && message_handler_->IsInNativeMoveResizeLoop();
+@@ -186,6 +186,10 @@ bool DesktopWindowTreeHostWin::IsInNativeMoveResizeLoop() const {
+                               message_handler_->IsInNativeMenuLoop());
  }
  
 +void DesktopWindowTreeHostWin::SetIsTranslucent(bool is_translucent) {
@@ -23,7 +23,7 @@ index 16237d29c8fb1ac0c7ea8a8db5f5b619cd463b30..72281fcf10313c405fc784171a25c594
  
  void DesktopWindowTreeHostWin::Init(const Widget::InitParams& params) {
 diff --git a/ui/views/widget/desktop_aura/desktop_window_tree_host_win.h b/ui/views/widget/desktop_aura/desktop_window_tree_host_win.h
-index bf2d643342c9185452cac05ad6451843b586d5c2..cad8f92a5ffdd717ceaa6b7c1ca32ed71a23c1b6 100644
+index 12edd2db9b88af65892cd5c183271258eaccf63d..b9ee5824e422b75ad37536c8848ef825a5d1fd6e 100644
 --- a/ui/views/widget/desktop_aura/desktop_window_tree_host_win.h
 +++ b/ui/views/widget/desktop_aura/desktop_window_tree_host_win.h
 @@ -96,6 +96,8 @@ class VIEWS_EXPORT DesktopWindowTreeHostWin
@@ -36,10 +36,10 @@ index bf2d643342c9185452cac05ad6451843b586d5c2..cad8f92a5ffdd717ceaa6b7c1ca32ed7
    // Overridden from DesktopWindowTreeHost:
    void Init(const Widget::InitParams& params) override;
 diff --git a/ui/views/win/hwnd_message_handler.cc b/ui/views/win/hwnd_message_handler.cc
-index b57e44705ae799beecf93fadf7edcc9bd5c110f9..e864151d374aaebad4956bf7ee7f938e399b6076 100644
+index ea4de3da0c46b6147b259d0f5fc6502796a17133..c958284e0fff644b8e8d2a55a7592207d3335bea 100644
 --- a/ui/views/win/hwnd_message_handler.cc
 +++ b/ui/views/win/hwnd_message_handler.cc
-@@ -998,13 +998,13 @@ void HWNDMessageHandler::FrameTypeChanged() {
+@@ -1055,13 +1055,13 @@ void HWNDMessageHandler::FrameTypeChanged() {
  
  void HWNDMessageHandler::PaintAsActiveChanged() {
    if (!delegate_->HasNonClientView() || !delegate_->CanActivate() ||
@@ -55,7 +55,7 @@ index b57e44705ae799beecf93fadf7edcc9bd5c110f9..e864151d374aaebad4956bf7ee7f938e
  }
  
  void HWNDMessageHandler::SetWindowIcons(const gfx::ImageSkia& window_icon,
-@@ -1085,7 +1085,14 @@ void HWNDMessageHandler::SizeConstraintsChanged() {
+@@ -1142,7 +1142,14 @@ void HWNDMessageHandler::SizeConstraintsChanged() {
    //   allowing ui::GetResizableFrameThickness() to be used consistently when
    //   removing the visible system frame.
    const bool had_caption_on_init = window_style() & WS_CAPTION;
@@ -71,7 +71,7 @@ index b57e44705ae799beecf93fadf7edcc9bd5c110f9..e864151d374aaebad4956bf7ee7f938e
    const bool can_maximize = can_resize && delegate_->CanMaximize();
  
    auto set_style_func = [&style](LONG bit, bool should_set) {
-@@ -1694,11 +1701,16 @@ void HWNDMessageHandler::ResetWindowRegion(bool force, bool redraw) {
+@@ -1797,11 +1804,16 @@ void HWNDMessageHandler::ResetWindowRegion(bool force, bool redraw) {
    // through, but that isn't the case when using Direct3D to draw transparent
    // windows. So we route translucent windows throught to the delegate to
    // allow for a custom hit mask.
@@ -89,7 +89,7 @@ index b57e44705ae799beecf93fadf7edcc9bd5c110f9..e864151d374aaebad4956bf7ee7f938e
      return;
    }
  
-@@ -2454,17 +2466,18 @@ LRESULT HWNDMessageHandler::OnNCActivate(UINT message,
+@@ -2562,17 +2574,18 @@ LRESULT HWNDMessageHandler::OnNCActivate(UINT message,
      delegate_->SchedulePaint();
    }
  

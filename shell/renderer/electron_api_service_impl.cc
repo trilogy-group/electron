@@ -4,11 +4,9 @@
 
 #include "electron/shell/renderer/electron_api_service_impl.h"
 
-#include <string_view>
 #include <utility>
 #include <vector>
 
-#include "base/trace_event/trace_event.h"
 #include "gin/data_object_builder.h"
 #include "mojo/public/cpp/system/platform_handle.h"
 #include "shell/common/electron_constants.h"

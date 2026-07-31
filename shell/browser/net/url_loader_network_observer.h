@@ -65,7 +65,7 @@ class URLLoaderNetworkObserver
       const std::optional<base::UnguessableToken>& window_id,
       const scoped_refptr<net::SSLCertRequestInfo>& cert_info,
       mojo::PendingRemote<network::mojom::ClientCertificateResponder>
-          client_cert_responder) override {}
+          client_cert_responder) override;
   void OnLocalNetworkAccessPermissionRequired(
       network::mojom::TransportType transport_type,
       network::mojom::IPAddressSpace ip_address_space,
@@ -77,9 +77,6 @@ class URLLoaderNetworkObserver
       network::mojom::IPAddressSpace response_address_space,
       network::mojom::IPAddressSpace client_address_space,
       network::mojom::IPAddressSpace target_address_space) override {}
-  void OnAdAuctionEventRecordHeaderReceived(
-      network::AdAuctionEventRecord event_record,
-      const std::optional<url::Origin>& top_frame_origin) override {}
   void Clone(
       mojo::PendingReceiver<network::mojom::URLLoaderNetworkServiceObserver>
           observer) override;

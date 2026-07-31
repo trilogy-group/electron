@@ -30,6 +30,7 @@
 #endif
 
 #if BUILDFLAG(ENABLE_PRINT_PREVIEW)
+#include "components/printing/browser/print_composite_client.h"
 #include "mojo/public/cpp/bindings/message.h"
 #endif
 
@@ -126,6 +127,16 @@ void PrintViewManagerElectron::ScriptedPrint(
 }
 
 #if BUILDFLAG(ENABLE_PRINT_PREVIEW)
+void PrintViewManagerElectron::SetAccessibilityTree(
+    int32_t cookie,
+    const ui::AXTreeUpdate& accessibility_tree) {
+  auto* client =
+      printing::PrintCompositeClient::FromWebContents(web_contents());
+  if (client) {
+    client->SetAccessibilityTree(cookie, accessibility_tree);
+  }
+}
+
 void PrintViewManagerElectron::GetPrintPreviewParams(
     GetPrintPreviewParamsCallback callback) {
   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
@@ -186,7 +197,7 @@ void PrintViewManagerElectron::GetPrintPreviewParams(
 #endif
 
   std::unique_ptr<printing::PrinterQuery> query =
-      queue()->CreatePrinterQuery(GetCurrentTargetFrame()->GetGlobalId());
+      queue()->CreatePrinterQuery(CurrentTargetFrame().GetGlobalId());
   auto* query_ptr = query.get();
   // We need to clone this before calling SetSettings because some environments
   // evaluate job_settings.Clone() first, and some std::move(job_settings)
@@ -265,9 +276,10 @@ void PrintViewManagerElectron::RequestPrintPreview(
   mojo::ReportBadMessage(kInvalidRequestPrintPreviewCall);
 }
 
-void PrintViewManagerElectron::CheckForCancel(int32_t preview_ui_id,
-                                              int32_t request_id,
-                                              CheckForCancelCallback callback) {
+void PrintViewManagerElectron::CheckForCancel(
+    const base::UnguessableToken& preview_ui_id,
+    int32_t request_id,
+    CheckForCancelCallback callback) {
   std::move(callback).Run(false);
 }
 #endif  // BUILDFLAG(ENABLE_PRINT_PREVIEW)
