@@ -6,7 +6,8 @@
 # target, or a job timeout replays only the work since the last snapshot.
 #
 # Env: ELECTRON_VERSION (required), GN_CC_WRAPPER, SNAPSHOT_INTERVAL_SECONDS,
-#      MAX_PASSES, plus everything out-cache.sh needs.
+#      MAX_PASSES, NINJA_J (optional; forwarded as `e build -j N`), plus
+#      everything out-cache.sh needs.
 set -uo pipefail
 
 : "${ELECTRON_VERSION:?ELECTRON_VERSION is required}"
@@ -59,10 +60,15 @@ run_pass() {
   # The throttler is the tail of a pipeline, so the build's own status has to
   # travel out of band.
   rc_file="$(mktemp)"
+  local j_args=()
+  if [ -n "${NINJA_J:-}" ]; then
+    j_args=(-j "$NINJA_J")
+    echo "ninja parallelism: -j ${NINJA_J}"
+  fi
   # Job control gives the pass its own process group, so the signal below
   # reaches ninja and its compiler children rather than just the `e` wrapper.
   set -m
-  { CI=1 GN_EXTRA_ARGS="$(gn_extra_args)" e build --no-remote 2>&1; echo $? > "$rc_file"; } \
+  { CI=1 GN_EXTRA_ARGS="$(gn_extra_args)" e build --no-remote "${j_args[@]}" 2>&1; echo $? > "$rc_file"; } \
     | python3 "$SCRIPT_DIR/throttle-build-output.py" "$PROGRESS_INTERVAL_SECONDS" &
   pid=$!
   set +m

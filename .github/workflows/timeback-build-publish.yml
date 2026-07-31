@@ -1,7 +1,7 @@
 # TimeBack: build patched Electron on the same runner *labels* TimeBack Frontend uses,
 # then publish binaries to GitHub Releases and the npm package to GitHub Packages.
 #
-# Reuses machines only (macos-latest-xlarge / wseng-windows-latest-8vcpu).
+# Reuses machines only (macos-latest-xlarge / wseng-windows-latest-32vcpu).
 # Does NOT reuse Electron upstream publish pipelines or TimeBack app build-template.
 #
 # Caching (our own, since Electron's Azure src cache + RBE are maintainer-only):
@@ -44,7 +44,7 @@ on:
         type: boolean
         default: true
       build_win:
-        description: 'Build Windows (x64 on wseng-windows-latest-8vcpu)'
+        description: 'Build Windows (x64 + arm64 on wseng-windows-latest-32vcpu, ninja -j64)'
         type: boolean
         default: true
       use_src_cache:
@@ -68,7 +68,9 @@ on:
 permissions: {}
 
 concurrency:
-  group: timeback-electron-build-${{ github.ref }}
+  # Split by platform so a Windows-only dispatch cannot cancel/queue behind an
+  # in-flight mac run (and vice versa). cancel-in-progress stays false always.
+  group: timeback-electron-build-${{ github.ref }}-mac${{ inputs.build_mac }}-win${{ inputs.build_win }}
   cancel-in-progress: false
 
 env:
@@ -328,9 +330,13 @@ jobs:
 
   build-win:
     if: ${{ inputs.build_win }}
-    name: Build Windows x64
-    runs-on: wseng-windows-latest-8vcpu
+    name: Build Windows ${{ matrix.arch }}
+    runs-on: wseng-windows-latest-32vcpu
     timeout-minutes: 720
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
     permissions:
       contents: read
       id-token: write
@@ -339,7 +345,9 @@ jobs:
         shell: bash
     env:
       TARGET_PLATFORM: win
-      TARGET_ARCH: x64
+      TARGET_ARCH: ${{ matrix.arch }}
+      # 32-vCPU box: force 2× oversubscribe (user directive). Cap via NINJA_J if needed.
+      NINJA_J: '64'
     steps:
       - name: Runner specs
         run: |
@@ -457,12 +465,14 @@ jobs:
       - name: Init build config
         run: |
           set -euo pipefail
-          e init -f timeback-win \
+          # --target-cpu lets the x64 32vcpu host cross-compile win-arm64.
+          e init -f "timeback-win-${TARGET_ARCH}" \
             --root="$(pwd)" \
             --out=Release \
             -i release \
             --remote-build none \
-            --use-https
+            --use-https \
+            --target-cpu "${TARGET_ARCH}"
 
       - name: Restore src cache
         if: steps.src-cache.outputs.hit == 'true'
@@ -561,7 +571,7 @@ jobs:
       - name: Upload win artifact
         uses: actions/upload-artifact@v4
         with:
-          name: electron-win32-x64
+          name: electron-win32-${{ matrix.arch }}
           path: artifacts/*.zip
           if-no-files-found: error
           retention-days: 14
@@ -598,7 +608,7 @@ jobs:
           find dist-zips -type f -print
           ls -lah dist-zips
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release (merge assets; never drop other arches)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -620,8 +630,10 @@ jobs:
           Branch: \`${{ github.ref_name }}\`
           Commit: \`${{ github.sha }}\`"
 
+          # --clobber replaces only same-named zips; other arch assets on the
+          # Release are left alone (mac publish does not wipe win, and vice versa).
           if gh release view "$TAG" -R trilogy-group/electron >/dev/null 2>&1; then
-            echo "Release $TAG already exists — uploading/replacing assets"
+            echo "Release $TAG already exists — uploading/replacing assets from this run only"
             gh release upload "$TAG" dist-zips/*.zip -R trilogy-group/electron --clobber
           else
             gh release create "$TAG" dist-zips/*.zip \
@@ -631,12 +643,30 @@ jobs:
               --target "${{ github.sha }}"
           fi
 
-      - name: Build checksums.json
+      - name: Build checksums.json from ALL Release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          TAG="v${ELECTRON_VERSION}"
+          mkdir -p all-zips
+          # Start from this run's artifacts, then pull every electron-*.zip already
+          # on the Release so a Windows-only (or Mac-only) publish cannot shrink
+          # checksums.json and break the other platform's npm install.
+          cp dist-zips/*.zip all-zips/
+          gh release download "$TAG" -R trilogy-group/electron -D release-zips -p 'electron-*.zip'
+          for f in release-zips/electron-*.zip; do
+            [ -e "$f" ] || continue
+            base=$(basename "$f")
+            if [ ! -f "all-zips/$base" ]; then
+              cp "$f" "all-zips/$base"
+              echo "merged existing Release asset: $base"
+            fi
+          done
+          ls -lah all-zips
           python3 <<'PY'
           import hashlib, json, pathlib
-          root = pathlib.Path("dist-zips")
+          root = pathlib.Path("all-zips")
           checksums = {}
           for path in sorted(root.glob("*.zip")):
               h = hashlib.sha256()
@@ -724,6 +754,16 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
+          # Same version may already exist from an earlier arch publish. Replace it
+          # so checksums.json gains the newly built platforms instead of sticking
+          # forever to the first arch that landed.
+          if npm view "@trilogy-group/electron@${ELECTRON_VERSION}" version \
+               --registry=https://npm.pkg.github.com >/dev/null 2>&1; then
+            echo "Version ${ELECTRON_VERSION} already on GitHub Packages — unpublishing to republish with merged checksums"
+            npm unpublish "@trilogy-group/electron@${ELECTRON_VERSION}" \
+              --registry=https://npm.pkg.github.com --force || true
+          fi
           npm publish --access restricted
           echo "Published @trilogy-group/electron@${ELECTRON_VERSION}"
           echo "Binaries: ${TIMEBACK_ELECTRON_MIRROR}v${ELECTRON_VERSION}/"
