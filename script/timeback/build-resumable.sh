@@ -6,7 +6,8 @@
 # target, or a job timeout replays only the work since the last snapshot.
 #
 # Env: ELECTRON_VERSION (required), GN_CC_WRAPPER, SNAPSHOT_INTERVAL_SECONDS,
-#      MAX_PASSES, plus everything out-cache.sh needs.
+#      MAX_PASSES, NINJA_J (optional; forwarded as `e build -j N`), plus
+#      everything out-cache.sh needs.
 set -uo pipefail
 
 : "${ELECTRON_VERSION:?ELECTRON_VERSION is required}"
@@ -55,6 +56,18 @@ checkpoint_interval_for_pass() {
   printf '%s' "$interval"
 }
 
+# Left unset, ninja picks its own parallelism (cores + 2). NINJA_J overrides that,
+# which is how the 32-vCPU Windows box gets oversubscribed. macOS bash is 3.2, where
+# expanding an empty array under `set -u` is an error, so branch on the variable
+# instead of building an args array.
+run_build() {
+  if [ -n "${NINJA_J:-}" ]; then
+    CI=1 GN_EXTRA_ARGS="$(gn_extra_args)" e build --no-remote -j "$NINJA_J" 2>&1
+  else
+    CI=1 GN_EXTRA_ARGS="$(gn_extra_args)" e build --no-remote 2>&1
+  fi
+}
+
 # Every edge ninja has ever completed in this build dir, across passes and runs.
 edges_completed() {
   local log="${OUT_DIR:-src/out/Release}/.ninja_log"
@@ -74,7 +87,7 @@ run_pass() {
   # Job control gives the pass its own process group, so the signal below
   # reaches ninja and its compiler children rather than just the `e` wrapper.
   set -m
-  { CI=1 GN_EXTRA_ARGS="$(gn_extra_args)" e build --no-remote 2>&1; echo $? > "$rc_file"; } \
+  { run_build; echo $? > "$rc_file"; } \
     | python3 "$SCRIPT_DIR/throttle-build-output.py" "$PROGRESS_INTERVAL_SECONDS" &
   pid=$!
   set +m
@@ -116,6 +129,20 @@ run_pass() {
   rm -f "$rc_file"
   return "${build_rc:-1}"
 }
+
+# Build duration is dominated by how many cores this box actually has, so record the
+# parallelism in the log — otherwise a slow build is indistinguishable from a
+# misconfigured one.
+if command -v nproc >/dev/null 2>&1; then
+  cores="$(nproc)"
+else
+  cores="$(sysctl -n hw.ncpu 2>/dev/null || echo unknown)"
+fi
+if [ -n "${NINJA_J:-}" ]; then
+  echo "ninja parallelism: -j ${NINJA_J} (host reports ${cores} cores)"
+else
+  echo "ninja parallelism: ninja default, normally cores+2 (host reports ${cores} cores)"
+fi
 
 "$SCRIPT_DIR/out-cache.sh" restore
 
