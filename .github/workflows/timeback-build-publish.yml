@@ -319,6 +319,13 @@ jobs:
           mkdir -p artifacts
           cp "$OUT/dist.zip" "artifacts/$ARTIFACT"
           ls -lh artifacts
+          echo "SMOKE_ARTIFACT=artifacts/$ARTIFACT" >> "$GITHUB_ENV"
+
+      # Prove the packaged binary before it can be published: it must report our
+      # version and carry the fetch-intercept patch set. A bad binary fails here,
+      # in the same run, rather than after it ships.
+      - name: Smoke test packaged binary
+        run: bash src/electron/script/timeback/smoke-test.sh "$SMOKE_ARTIFACT" macos "$ELECTRON_VERSION"
 
       - name: Upload mac artifact
         uses: actions/upload-artifact@v4
@@ -567,6 +574,16 @@ jobs:
           mkdir -p artifacts
           cp "$OUT/dist.zip" "artifacts/$ARTIFACT"
           ls -lh artifacts
+          echo "SMOKE_ARTIFACT=artifacts/$ARTIFACT" >> "$GITHUB_ENV"
+
+      # Prove the packaged binary before it can be published: it must report our
+      # version and carry the fetch-intercept patch set. A bad binary fails here,
+      # in the same run, rather than after it ships. Only the x64 build is native
+      # to this x64 host; the arm64 build is cross-compiled and cannot execute
+      # here, so it is packaged and published without an in-run launch check.
+      - name: Smoke test packaged binary
+        if: ${{ matrix.arch == 'x64' }}
+        run: bash src/electron/script/timeback/smoke-test.sh "$SMOKE_ARTIFACT" windows "$ELECTRON_VERSION"
 
       - name: Upload win artifact
         uses: actions/upload-artifact@v4
