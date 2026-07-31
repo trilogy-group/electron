@@ -24,12 +24,13 @@ framework_bytes=$(stat -f '%z' "$OUT_DIR/obj/electron/electron_framework_shared_
 dry_run=$(mktemp)
 trap 'rm -f "$dry_run"' EXIT
 
-# `e build` regenerates GN before invoking autoninja. A dry-run alone can inspect
-# the stale restored graph and badly undercount pending edges, so force the same
-# regeneration first. GN_EXTRA_ARGS is identical to the real build's.
-CI=1 e d gn gen "$OUT_DIR"
+# `e build` regenerates GN before invoking ninja. Use the same entrypoint so
+# cwd/root/.gn resolution matches the real compile (raw `e d gn gen src/out/...`
+# fails with "Can't find source root" on macOS runners).
+CI=1 e build --gen=only --no-remote
 
 # Dry-run the regenerated graph. This executes no build edge.
+# Workflow cwd is the repo root (parent of src/), so -C takes src/out/Release.
 e d autoninja -C "$OUT_DIR" -n electron > "$dry_run" 2>&1 || {
   echo "resume preflight failed: ninja dry-run errored" >&2
   tail -100 "$dry_run" >&2

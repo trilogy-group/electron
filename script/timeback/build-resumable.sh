@@ -60,16 +60,19 @@ run_pass() {
   # The throttler is the tail of a pipeline, so the build's own status has to
   # travel out of band.
   rc_file="$(mktemp)"
-  local j_args=()
-  if [ -n "${NINJA_J:-}" ]; then
-    j_args=(-j "$NINJA_J")
-    echo "ninja parallelism: -j ${NINJA_J}"
-  fi
   # Job control gives the pass its own process group, so the signal below
   # reaches ninja and its compiler children rather than just the `e` wrapper.
+  # macOS ships bash 3.2: empty "${arr[@]}" under `set -u` is an unbound-variable
+  # error, so branch on NINJA_J instead of building an args array.
   set -m
-  { CI=1 GN_EXTRA_ARGS="$(gn_extra_args)" e build --no-remote "${j_args[@]}" 2>&1; echo $? > "$rc_file"; } \
-    | python3 "$SCRIPT_DIR/throttle-build-output.py" "$PROGRESS_INTERVAL_SECONDS" &
+  if [ -n "${NINJA_J:-}" ]; then
+    echo "ninja parallelism: -j ${NINJA_J}"
+    { CI=1 GN_EXTRA_ARGS="$(gn_extra_args)" e build --no-remote -j "$NINJA_J" 2>&1; echo $? > "$rc_file"; } \
+      | python3 "$SCRIPT_DIR/throttle-build-output.py" "$PROGRESS_INTERVAL_SECONDS" &
+  else
+    { CI=1 GN_EXTRA_ARGS="$(gn_extra_args)" e build --no-remote 2>&1; echo $? > "$rc_file"; } \
+      | python3 "$SCRIPT_DIR/throttle-build-output.py" "$PROGRESS_INTERVAL_SECONDS" &
+  fi
   pid=$!
   set +m
 
@@ -121,7 +124,8 @@ run_pass() {
 "$SCRIPT_DIR/out-cache.sh" restore
 
 if [ "$USE_OUT_CACHE" = "true" ] && [ -f "${OUT_DIR:-src/out/Release}/.ninja_log" ]; then
-  GN_EXTRA_ARGS="$(gn_extra_args)" "$SCRIPT_DIR/verify-out-cache.sh"
+  # This script has `set -u` but not `-e`; a failed preflight must stop the build.
+  GN_EXTRA_ARGS="$(gn_extra_args)" "$SCRIPT_DIR/verify-out-cache.sh" || exit 1
 fi
 
 rc=0
