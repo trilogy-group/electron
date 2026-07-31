@@ -2,7 +2,11 @@
 # Prove a restored out/Release will resume before spending hours compiling.
 set -euo pipefail
 
-readonly MAX_PENDING_EDGES="${MAX_PENDING_EDGES:-20000}"
+# After restore we delete build.ninja so gn can regenerate xcode_links; the
+# resulting dry-run often lists ~30-50k edges (mostly cheap COPY_BUNDLE_DATA)
+# even when the heavy compile outputs are already present. 20k was rejecting
+# healthy resumes. 100k still catches a true cold rebuild (~200k+ pending).
+readonly MAX_PENDING_EDGES="${MAX_PENDING_EDGES:-100000}"
 readonly OUT_DIR="${OUT_DIR:-src/out/Release}"
 readonly REQUIRED_OUTPUTS=(
   ".ninja_log"

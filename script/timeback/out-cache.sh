@@ -133,11 +133,19 @@ restore() {
       echo "baseline restore failed; falling back to object sync"
       find "$OUT_DIR" -mindepth 1 -delete 2>/dev/null || true
     elif [ -f "$OUT_DIR/$SANITY_FILE" ]; then
-      # The archive is a complete immutable checkpoint. Do not combine it with
-      # an unversioned mutable mirror; that could create a state that never
-      # existed. Ninja resumes from the archive's internally consistent state.
+      # Baseline is a fast-restore snapshot; checkpoints after it live only in
+      # the object mirror until the next baseline refresh (every
+      # BASELINE_REFRESH_SECONDS). Overlay the mirror so a cancel/fail
+      # checkpoint taken between refreshes is not thrown away.
+      echo "restored immutable baseline $baseline ($(du -sh "$OUT_DIR" | cut -f1))"
+      echo "overlaying object mirror deltas on top of baseline"
+      if aws s3 sync "$S3_URI" "$OUT_DIR" "${SYNC_FLAGS[@]}" "${CACHE_EXCLUDES[@]}"; then
+        echo "object mirror overlay complete ($(du -sh "$OUT_DIR" | cut -f1))"
+      else
+        echo "object mirror overlay failed; continuing with baseline only"
+      fi
       invalidate_ninja_for_xcode_links
-      echo "restored immutable baseline $baseline ($(du -sh "$OUT_DIR" | cut -f1)); invalidated ninja files for xcode_links regen"
+      echo "invalidated ninja files for xcode_links regen"
       return 0
     else
       echo "baseline extract incomplete; falling back to full object sync"
