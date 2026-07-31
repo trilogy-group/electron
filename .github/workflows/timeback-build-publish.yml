@@ -1,12 +1,13 @@
 # TimeBack: build patched Electron on the same runner *labels* TimeBack Frontend uses,
 # then publish binaries to GitHub Releases and the npm package to GitHub Packages.
 #
-# Reuses machines only (macos-latest-xlarge / wseng-windows-latest-8vcpu).
+# Reuses machines only (macos-latest-xlarge / wseng-windows-latest-32vcpu).
 # Does NOT reuse Electron upstream publish pipelines or TimeBack app build-template.
 #
 # Caching (our own, since Electron's Azure src cache + RBE are maintainer-only):
 #   src-cache/<platform>/v2-src-cache-<depshash>.tar.zst  → synced Chromium tree
 #   out-cache/<platform>-<arch>/<depshash>/                → mirrored out/Release
+#     baseline.tar.zst                                     → fast restore (~10-20 min)
 #   sccache/                                              → compile object cache (opt-in)
 # Both live in s3://timeback-electron-src-cache (tbdev, 60-day lifecycle), reached
 # via OIDC role TimebackElectronCacheRole which is scoped to this repo + those prefixes.
@@ -43,7 +44,7 @@ on:
         type: boolean
         default: true
       build_win:
-        description: 'Build Windows (x64 on wseng-windows-latest-8vcpu)'
+        description: 'Build Windows (x64 + arm64 on wseng-windows-latest-32vcpu, ninja -j64)'
         type: boolean
         default: true
       use_src_cache:
@@ -67,7 +68,9 @@ on:
 permissions: {}
 
 concurrency:
-  group: timeback-electron-build-${{ github.ref }}
+  # Split by platform so a Windows-only dispatch cannot cancel/queue behind an
+  # in-flight mac run (and vice versa). cancel-in-progress stays false always.
+  group: timeback-electron-build-${{ github.ref }}-mac${{ inputs.build_mac }}-win${{ inputs.build_win }}
   cancel-in-progress: false
 
 env:
@@ -327,9 +330,13 @@ jobs:
 
   build-win:
     if: ${{ inputs.build_win }}
-    name: Build Windows x64
-    runs-on: wseng-windows-latest-8vcpu
+    name: Build Windows ${{ matrix.arch }}
+    runs-on: wseng-windows-latest-32vcpu
     timeout-minutes: 720
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
     permissions:
       contents: read
       id-token: write
@@ -338,7 +345,9 @@ jobs:
         shell: bash
     env:
       TARGET_PLATFORM: win
-      TARGET_ARCH: x64
+      TARGET_ARCH: ${{ matrix.arch }}
+      # 32-vCPU box: force 2× oversubscribe (user directive). Cap via NINJA_J if needed.
+      NINJA_J: '64'
     steps:
       - name: Runner specs
         run: |
@@ -456,12 +465,14 @@ jobs:
       - name: Init build config
         run: |
           set -euo pipefail
-          e init -f timeback-win \
+          # --target-cpu lets the x64 32vcpu host cross-compile win-arm64.
+          e init -f "timeback-win-${TARGET_ARCH}" \
             --root="$(pwd)" \
             --out=Release \
             -i release \
             --remote-build none \
-            --use-https
+            --use-https \
+            --target-cpu "${TARGET_ARCH}"
 
       - name: Restore src cache
         if: steps.src-cache.outputs.hit == 'true'
@@ -560,163 +571,30 @@ jobs:
       - name: Upload win artifact
         uses: actions/upload-artifact@v4
         with:
-          name: electron-win32-x64
+          name: electron-win32-${{ matrix.arch }}
           path: artifacts/*.zip
           if-no-files-found: error
           retention-days: 14
 
+  # The publish logic lives in timeback-publish.yml so that
+  # timeback-publish-rehearsal.yml can exercise this exact code in ~2 minutes with
+  # stub zips. Do not inline it back here: an untested publish step turns a typo
+  # into another full Chromium rebuild.
   publish:
     name: Publish Release + npm
     needs: [build-mac, build-win]
-    if: ${{ always() && inputs.publish && (needs.build-mac.result == 'success' || needs.build-win.result == 'success') }}
-    runs-on: ubuntu-latest
+    if: >-
+      ${{
+        always() &&
+        inputs.publish &&
+        (!inputs.build_mac || needs.build-mac.result == 'success') &&
+        (!inputs.build_win || needs.build-win.result == 'success')
+      }}
     permissions:
       contents: write
       packages: write
-    steps:
-      - name: Checkout npm package sources
-        uses: actions/checkout@v4
-        with:
-          path: electron
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist-zips
-          pattern: electron-*
-          merge-multiple: true
-
-      - name: List artifacts
-        run: |
-          find dist-zips -type f -print
-          ls -lah dist-zips
-
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          TAG="v${ELECTRON_VERSION}"
-          TITLE="TimeBack Electron ${ELECTRON_VERSION}"
-          NOTES="Patched Electron build for TimeBack (five Chromium crash patches).
-
-          ## Install (npm / GitHub Packages)
-          \`\`\`bash
-          npm install @trilogy-group/electron@${ELECTRON_VERSION} --registry=https://npm.pkg.github.com
-          \`\`\`
-
-          Or keep \`electron@${ELECTRON_VERSION}\` and set:
-          \`\`\`
-          ELECTRON_MIRROR=https://github.com/trilogy-group/electron/releases/download/
-          \`\`\`
-
-          Branch: \`${{ github.ref_name }}\`
-          Commit: \`${{ github.sha }}\`"
-
-          if gh release view "$TAG" -R trilogy-group/electron >/dev/null 2>&1; then
-            echo "Release $TAG already exists — uploading/replacing assets"
-            gh release upload "$TAG" dist-zips/*.zip -R trilogy-group/electron --clobber
-          else
-            gh release create "$TAG" dist-zips/*.zip \
-              -R trilogy-group/electron \
-              --title "$TITLE" \
-              --notes "$NOTES" \
-              --target "${{ github.sha }}"
-          fi
-
-      - name: Build checksums.json
-        run: |
-          set -euo pipefail
-          python3 <<'PY'
-          import hashlib, json, pathlib
-          root = pathlib.Path("dist-zips")
-          checksums = {}
-          for path in sorted(root.glob("*.zip")):
-              h = hashlib.sha256()
-              with path.open("rb") as f:
-                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                      h.update(chunk)
-              checksums[path.name] = h.hexdigest()
-          pathlib.Path("checksums.json").write_text(json.dumps(checksums, indent=2) + "\n")
-          print(json.dumps(checksums, indent=2))
-          PY
-
-      - name: Prepare @trilogy-group/electron npm package
-        run: |
-          set -euo pipefail
-          mkdir -p npm-publish
-          cp -R electron/npm/. npm-publish/
-          cp checksums.json npm-publish/checksums.json
-
-          # Rewrite package.json for GitHub Packages + our mirror.
-          node <<'NODE'
-          const fs = require('fs');
-          const path = require('path');
-          const version = process.env.ELECTRON_VERSION;
-          const mirror = process.env.TIMEBACK_ELECTRON_MIRROR;
-          const pkgPath = path.join('npm-publish', 'package.json');
-          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-          pkg.name = '@trilogy-group/electron';
-          pkg.version = version;
-          pkg.repository = {
-            type: 'git',
-            url: 'git+https://github.com/trilogy-group/electron.git'
-          };
-          pkg.publishConfig = {
-            registry: 'https://npm.pkg.github.com'
-          };
-          // Ensure install resolves binaries from our Releases even without ELECTRON_MIRROR.
-          pkg.config = {
-            ...(pkg.config || {}),
-            electron_mirror: mirror,
-            electron_custom_dir: `v${version}`
-          };
-          fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
-
-          // Patch install.js to force our mirror (npm config is not always honored by @electron/get).
-          const installPath = path.join('npm-publish', 'install.js');
-          let install = fs.readFileSync(installPath, 'utf8');
-          if (!install.includes('TIMEBACK_MIRROR_INJECTED')) {
-            install = install.replace(
-              'downloadArtifact({',
-              `// TIMEBACK_MIRROR_INJECTED\nprocess.env.ELECTRON_MIRROR = process.env.ELECTRON_MIRROR || '${mirror}';\ndownloadArtifact({`
-            );
-            fs.writeFileSync(installPath, install);
-          }
-          console.log('Prepared', pkg.name, pkg.version);
-          NODE
-
-          # Need electron.d.ts from the repo for the package files list
-          if [ -f electron/electron.d.ts ]; then
-            cp electron/electron.d.ts npm-publish/electron.d.ts
-          elif [ -f electron/npm/electron.d.ts ]; then
-            cp electron/npm/electron.d.ts npm-publish/electron.d.ts
-          else
-            # Generated during full release; create a stub so pack does not fail if listed.
-            echo '// Types generated in official Electron releases; runtime package only.' > npm-publish/electron.d.ts
-          fi
-
-          # abi_version may be required by files list
-          if [ ! -f npm-publish/abi_version ] && [ -f electron/npm/abi_version ]; then
-            cp electron/npm/abi_version npm-publish/abi_version
-          elif [ ! -f npm-publish/abi_version ]; then
-            echo "0" > npm-publish/abi_version
-          fi
-
-          ls -la npm-publish
-
-      - name: Setup Node for GitHub Packages
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22.21.x'
-          registry-url: https://npm.pkg.github.com
-          scope: '@trilogy-group'
-
-      - name: Publish @trilogy-group/electron
-        working-directory: npm-publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          npm publish --access restricted
-          echo "Published @trilogy-group/electron@${ELECTRON_VERSION}"
-          echo "Binaries: ${TIMEBACK_ELECTRON_MIRROR}v${ELECTRON_VERSION}/"
+    uses: ./.github/workflows/timeback-publish.yml
+    with:
+      version: ${{ inputs.version }}
+      mirror: https://github.com/trilogy-group/electron/releases/download/
+      prerelease: false

@@ -1,0 +1,326 @@
+# TimeBack: publish Electron zips to GitHub Releases + @trilogy-group/electron on GitHub Packages.
+#
+# This is a reusable workflow (workflow_call) on purpose. Two callers share it:
+#
+#   timeback-build-publish.yml     → after a real 6-hour compile
+#   timeback-publish-rehearsal.yml → in ~2 minutes against stub zips
+#
+# Keeping one copy is the whole point: the rehearsal proves *this* file works, so a
+# typo here is found for the price of a cheap ubuntu job instead of a rebuilt Chromium.
+# Never fork this logic back into a caller.
+#
+# Order matters. The Release is created first because the npm package is verified by
+# actually downloading its zips back off the public Release URL through @electron/get,
+# exactly as a consumer would, before anything is pushed to the registry.
+
+name: TimeBack Publish (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version to publish (npm version and Release tag v<version>)'
+        required: true
+        type: string
+      mirror:
+        description: 'ELECTRON_MIRROR base the npm package installs binaries from'
+        required: false
+        type: string
+        default: https://github.com/trilogy-group/electron/releases/download/
+      prerelease:
+        description: 'Mark the GitHub Release as a prerelease (used by the rehearsal)'
+        required: false
+        type: boolean
+        default: false
+      npm_tag:
+        description: 'npm dist-tag to publish under'
+        required: false
+        type: string
+        default: timeback
+
+jobs:
+  publish:
+    name: Publish Release + npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    env:
+      # Mirrors the env the build workflow used to set at top level. Reusable
+      # workflows do not inherit the caller's env, so it is rebuilt from inputs
+      # and every step body below stays identical to what the build flow ran.
+      ELECTRON_VERSION: ${{ inputs.version }}
+      TIMEBACK_ELECTRON_MIRROR: ${{ inputs.mirror }}
+    steps:
+      - name: Checkout npm package sources
+        uses: actions/checkout@v4
+        with:
+          path: electron
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-zips
+          pattern: electron-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: |
+          find dist-zips -type f -print
+          ls -lah dist-zips
+
+      # @electron/get derives the asset name from the version it was asked for, so a
+      # zip whose name disagrees with the published version is a silent install 404.
+      # Catch that here rather than in a consumer's node_modules.
+      - name: Validate artifact names against version
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=(dist-zips/*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::error::no electron-*.zip artifacts were downloaded; nothing to publish"
+            exit 1
+          fi
+          bad=0
+          for z in "${zips[@]}"; do
+            base=$(basename "$z")
+            case "$base" in
+              "electron-v${ELECTRON_VERSION}-"*.zip) echo "ok   $base" ;;
+              *) echo "::error::$base does not match electron-v${ELECTRON_VERSION}-<platform>-<arch>.zip"; bad=1 ;;
+            esac
+          done
+          [ "$bad" -eq 0 ]
+
+      - name: Create GitHub Release (merge assets; never drop other arches)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="v${ELECTRON_VERSION}"
+          TITLE="TimeBack Electron ${ELECTRON_VERSION}"
+          NOTES="Patched Electron build for TimeBack (five Chromium crash patches).
+
+          ## Install (npm / GitHub Packages)
+          \`\`\`bash
+          npm install @trilogy-group/electron@${ELECTRON_VERSION} --registry=https://npm.pkg.github.com
+          \`\`\`
+
+          Or keep \`electron@${ELECTRON_VERSION}\` and set:
+          \`\`\`
+          ELECTRON_MIRROR=${TIMEBACK_ELECTRON_MIRROR}
+          \`\`\`
+
+          Branch: \`${{ github.ref_name }}\`
+          Commit: \`${{ github.sha }}\`"
+
+          # --clobber replaces only same-named zips; other arch assets on the
+          # Release are left alone (mac publish does not wipe win, and vice versa).
+          if gh release view "$TAG" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — uploading/replacing assets from this run only"
+            gh release upload "$TAG" dist-zips/*.zip -R "${{ github.repository }}" --clobber
+          else
+            gh release create "$TAG" dist-zips/*.zip \
+              -R "${{ github.repository }}" \
+              --title "$TITLE" \
+              --notes "$NOTES" \
+              ${{ inputs.prerelease && '--prerelease' || '' }} \
+              --target "${{ github.sha }}"
+          fi
+
+      - name: Build checksums from ALL Release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="v${ELECTRON_VERSION}"
+          mkdir -p all-zips release-zips
+          # Start from this run's artifacts, then pull every electron-*.zip already
+          # on the Release so a Windows-only (or Mac-only) publish cannot shrink
+          # checksums.json and break the other platform's npm install.
+          cp dist-zips/*.zip all-zips/
+          # A brand new Release only holds what we just pushed, so "no match" is a
+          # normal outcome here and must not abort the job under `set -e`.
+          gh release download "$TAG" -R "${{ github.repository }}" -D release-zips -p 'electron-*.zip' \
+            || echo "no pre-existing Release assets to merge"
+          for f in release-zips/electron-*.zip; do
+            [ -e "$f" ] || continue
+            base=$(basename "$f")
+            if [ ! -f "all-zips/$base" ]; then
+              cp "$f" "all-zips/$base"
+              echo "merged existing Release asset: $base"
+            fi
+          done
+          ls -lah all-zips
+          python3 <<'PY'
+          import hashlib, json, pathlib
+          root = pathlib.Path("all-zips")
+          checksums = {}
+          for path in sorted(root.glob("*.zip")):
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              checksums[path.name] = h.hexdigest()
+          pathlib.Path("checksums.json").write_text(json.dumps(checksums, indent=2) + "\n")
+          # Upstream shape, for consumers that opt into remote checksum verification
+          # via electron_use_remote_checksums instead of our bundled checksums.json.
+          pathlib.Path("SHASUMS256.txt").write_text(
+              "".join(f"{digest} *{name}\n" for name, digest in checksums.items())
+          )
+          print(json.dumps(checksums, indent=2))
+          PY
+
+      - name: Upload SHASUMS256.txt to the Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release upload "v${ELECTRON_VERSION}" SHASUMS256.txt \
+            -R "${{ github.repository }}" --clobber
+
+      - name: Prepare @trilogy-group/electron npm package
+        run: |
+          set -euo pipefail
+          mkdir -p npm-publish
+          cp -R electron/npm/. npm-publish/
+          cp checksums.json npm-publish/checksums.json
+
+          # Same script the local test harness runs, so a break shows up on a laptop
+          # rather than mid-publish.
+          node electron/script/timeback/prepare-npm-package.js npm-publish
+
+          # Need electron.d.ts from the repo for the package files list
+          if [ -f electron/electron.d.ts ]; then
+            cp electron/electron.d.ts npm-publish/electron.d.ts
+          elif [ -f electron/npm/electron.d.ts ]; then
+            cp electron/npm/electron.d.ts npm-publish/electron.d.ts
+          else
+            # Generated during full release; create a stub so pack does not fail if listed.
+            echo '// Types generated in official Electron releases; runtime package only.' > npm-publish/electron.d.ts
+          fi
+
+          # abi_version may be required by files list
+          if [ ! -f npm-publish/abi_version ] && [ -f electron/npm/abi_version ]; then
+            cp electron/npm/abi_version npm-publish/abi_version
+          elif [ ! -f npm-publish/abi_version ]; then
+            echo "0" > npm-publish/abi_version
+          fi
+
+          ls -la npm-publish
+
+      - name: Setup Node for GitHub Packages
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.x'
+          registry-url: https://npm.pkg.github.com
+          scope: '@trilogy-group'
+
+      # Upstream's publish-to-npm.ts does this before publishing and it is the only
+      # step that proves the whole chain: pack → install → @electron/get resolves our
+      # mirror → checksum in checksums.json matches → zip extracts → path.txt points
+      # at a file that exists. Publishing without it is publishing blind.
+      - name: Verify package installs from the Release (per platform)
+        run: |
+          set -euo pipefail
+          TARBALL="$PWD/npm-publish/$(cd npm-publish && npm pack --silent | tail -1)"
+          echo "packed $TARBALL"
+          ls -lh "$TARBALL"
+
+          # Release assets are occasionally not servable the instant the API returns,
+          # and @electron/get does not retry a 404. Wait for the URL we are about to
+          # depend on so a flake cannot be mistaken for a broken package.
+          for z in all-zips/electron-v${ELECTRON_VERSION}-*.zip; do
+            url="${TIMEBACK_ELECTRON_MIRROR}v${ELECTRON_VERSION}/$(basename "$z")"
+            for attempt in 1 2 3 4 5 6 7 8 9 10; do
+              if curl -sfLI "$url" -o /dev/null; then
+                echo "asset reachable: $url"
+                break
+              fi
+              if [ "$attempt" -eq 10 ]; then
+                echo "::error::asset never became downloadable: $url"
+                exit 1
+              fi
+              sleep 5
+            done
+          done
+
+          failures=0
+          for z in all-zips/electron-v${ELECTRON_VERSION}-*.zip; do
+            base=$(basename "$z" .zip)
+            suffix=${base#"electron-v${ELECTRON_VERSION}-"}
+            platform=${suffix%-*}
+            arch=${suffix##*-}
+            echo "=== verifying $platform-$arch ==="
+
+            work=$(mktemp -d)
+            ( cd "$work" && npm init -y >/dev/null 2>&1 )
+            if ! ( cd "$work" \
+                   && ELECTRON_INSTALL_PLATFORM="$platform" \
+                      ELECTRON_INSTALL_ARCH="$arch" \
+                      electron_config_cache="$work/cache" \
+                      npm install "$TARBALL" --no-audit --no-fund ); then
+              echo "::error::npm install failed for $platform-$arch"
+              failures=$((failures + 1))
+              continue
+            fi
+
+            # Force the lazy download now and assert the resolved binary is real.
+            if ! ( cd "$work" \
+                   && ELECTRON_INSTALL_PLATFORM="$platform" \
+                      ELECTRON_INSTALL_ARCH="$arch" \
+                      electron_config_cache="$work/cache" \
+                      node -e '
+                        const fs = require("fs");
+                        const p = require("@trilogy-group/electron");
+                        if (typeof p !== "string") throw new Error("module did not export a path: " + p);
+                        if (!fs.existsSync(p)) throw new Error("binary missing on disk: " + p);
+                        console.log("resolved binary:", p);
+                      ' ); then
+              echo "::error::require('@trilogy-group/electron') did not yield a real binary for $platform-$arch"
+              failures=$((failures + 1))
+            fi
+          done
+
+          if [ "$failures" -ne 0 ]; then
+            echo "::error::$failures platform(s) failed install verification — not publishing"
+            exit 1
+          fi
+          echo "all platforms verified against ${TIMEBACK_ELECTRON_MIRROR}v${ELECTRON_VERSION}/"
+        env:
+          # Consumers get the mirror baked into install.js; be explicit here too so a
+          # failure is unambiguously about the Release, not about env leakage.
+          ELECTRON_MIRROR: ${{ inputs.mirror }}
+
+      - name: Publish @trilogy-group/electron
+        working-directory: npm-publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # GitHub Packages refuses to overwrite an existing version, and `npm
+          # unpublish` is not supported there — the version has to be deleted through
+          # the packages API first. This happens when a later dispatch adds an arch to
+          # a version that already shipped, so checksums.json can grow to cover it.
+          if npm view "@trilogy-group/electron@${ELECTRON_VERSION}" version \
+               --registry=https://npm.pkg.github.com >/dev/null 2>&1; then
+            echo "Version ${ELECTRON_VERSION} already on GitHub Packages — deleting it to republish with merged checksums"
+            VERSION_ID=$(gh api \
+              "/orgs/${{ github.repository_owner }}/packages/npm/electron/versions" \
+              --jq ".[] | select(.name == \"${ELECTRON_VERSION}\") | .id" 2>/dev/null || true)
+            if [ -n "$VERSION_ID" ]; then
+              gh api -X DELETE \
+                "/orgs/${{ github.repository_owner }}/packages/npm/electron/versions/${VERSION_ID}" \
+                && echo "deleted package version ${ELECTRON_VERSION} (id ${VERSION_ID})" \
+                || echo "::warning::could not delete version ${VERSION_ID}; publish will likely conflict"
+            else
+              echo "::warning::could not resolve a package version id for ${ELECTRON_VERSION}"
+            fi
+          fi
+
+          if ! npm publish --access restricted --tag "${{ inputs.npm_tag }}"; then
+            echo "::error::npm publish failed. If this is a 409/EPUBLISHCONFLICT, GitHub Packages still holds ${ELECTRON_VERSION}; bump the version input or delete that package version by hand."
+            exit 1
+          fi
+          echo "Published @trilogy-group/electron@${ELECTRON_VERSION} (tag ${{ inputs.npm_tag }})"
+          echo "Binaries: ${TIMEBACK_ELECTRON_MIRROR}v${ELECTRON_VERSION}/"
