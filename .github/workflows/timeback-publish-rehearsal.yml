@@ -14,8 +14,18 @@
 # `rehearsal` dist-tag, marks the Release as a prerelease, and deletes both afterwards
 # so nothing here can be mistaken for a shippable build.
 #
-# Re-run twice with the same explicit `version` to also exercise the republish path
-# (GitHub Packages refusing to overwrite an existing version).
+# To rehearse the trickier multi-arch case — a later run adding an arch to a version
+# that already shipped, where checksums.json must MERGE rather than shrink — run it
+# twice with the same explicit version and complementary platform subsets:
+#
+#   run 1: version=43.2.0-rehearsal.merge platforms='darwin-arm64'          cleanup=false
+#   run 2: version=43.2.0-rehearsal.merge platforms='win32-x64 win32-arm64' cleanup=true
+#
+# The consume job always tests both macOS and Windows, so if run 2 dropped the darwin
+# entry from checksums.json the macOS consumer fails — which is exactly the
+# regression the merge logic exists to prevent. (A consequence: rehearsing a
+# Windows-only subset with no prior darwin asset will fail the macOS consumer, which
+# is correct rather than a bug.)
 
 name: TimeBack Publish Rehearsal
 
@@ -26,6 +36,10 @@ on:
         description: 'Version to rehearse with (blank = 43.2.0-rehearsal.<run number>)'
         required: false
         default: ''
+      platforms:
+        description: 'Space-separated <platform>-<arch> targets to fake (subset = rehearse a partial publish)'
+        required: false
+        default: 'darwin-arm64 win32-x64 win32-arm64'
       cleanup:
         description: 'Delete the rehearsal Release, tag and package version afterwards'
         type: boolean
@@ -44,12 +58,16 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.pick.outputs.version }}
+      matrix: ${{ steps.pick.outputs.matrix }}
     steps:
-      - name: Pick version
+      - name: Pick version and targets
         id: pick
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_PLATFORMS: ${{ inputs.platforms }}
         run: |
           set -euo pipefail
-          V="${{ inputs.version }}"
+          V="$REQUESTED_VERSION"
           if [ -z "$V" ]; then
             # Deliberately 43.2.0-*, not 0.0.0-*: @electron/get only verifies
             # checksums for versions >= 1.3.2, so a 0.0.0 rehearsal would skip the
@@ -59,6 +77,23 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "rehearsing with version $V"
 
+          MATRIX=$(python3 - <<'PY'
+          import json, os, sys
+          targets = os.environ["REQUESTED_PLATFORMS"].replace(",", " ").split()
+          if not targets:
+              sys.exit("no platforms requested")
+          entries = []
+          for t in targets:
+              platform, _, arch = t.rpartition("-")
+              if not platform or not arch:
+                  sys.exit(f"cannot parse target {t!r}; expected <platform>-<arch>")
+              entries.append({"platform": platform, "arch": arch})
+          print(json.dumps(entries))
+          PY
+          )
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "targets: $MATRIX"
+
   # Stand in for build-mac / build-win. Same artifact naming, same zip layout, so the
   # publish workflow cannot tell the difference — which is the point.
   stub-artifacts:
@@ -67,13 +102,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        include:
-          - platform: darwin
-            arch: arm64
-          - platform: win32
-            arch: x64
-          - platform: win32
-            arch: arm64
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
       ELECTRON_VERSION: ${{ needs.plan.outputs.version }}
     steps:
