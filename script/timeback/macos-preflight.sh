@@ -122,6 +122,20 @@ if [ "${PROFILE_COUNT}" -lt 1 ]; then
 fi
 echo "PGO profile blobs: ${PROFILE_COUNT}"
 
+echo "== Host toolchain sanity =="
+GN_BIN="src/buildtools/mac/gn"
+if [ ! -x "$GN_BIN" ]; then
+  echo "ERROR: missing ${GN_BIN}"
+  exit 1
+fi
+echo "gn binary: $(file "$GN_BIN")"
+if ! "$GN_BIN" --version; then
+  echo "ERROR: ${GN_BIN} is not runnable on this host"
+  echo "Likely restored an src-cache built for a different CPU (arm64 vs x64)."
+  echo "Caches must be keyed per host arch (macos-arm64 / macos-x64)."
+  exit 1
+fi
+
 echo "== GN generate (no compile) =="
 export CHROMIUM_BUILDTOOLS_PATH="${CHROMIUM_BUILDTOOLS_PATH:-$(pwd)/src/buildtools}"
 GN_EXTRA_ARGS="override_electron_version=\"${ELECTRON_VERSION}\""

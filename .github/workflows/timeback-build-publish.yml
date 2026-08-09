@@ -152,8 +152,10 @@ jobs:
           node src/electron/script/generate-deps-hash.js
           DEPSHASH="v2-src-cache-$(cat src/electron/.depshash)"
           echo "DEPSHASH=$DEPSHASH" >> "$GITHUB_ENV"
-          echo "CACHE_KEY=src-cache/${TARGET_PLATFORM}/${DEPSHASH}.tar.zst" >> "$GITHUB_ENV"
-          echo "Cache key: src-cache/${TARGET_PLATFORM}/${DEPSHASH}.tar.zst"
+          # Host toolchain (gn/clang) is arch-specific — do not share arm64/x64 caches.
+          echo "CACHE_KEY=src-cache/${TARGET_PLATFORM}-${TARGET_ARCH}/${DEPSHASH}.tar.zst" >> "$GITHUB_ENV"
+          echo "LEGACY_CACHE_KEY=src-cache/${TARGET_PLATFORM}/${DEPSHASH}.tar.zst" >> "$GITHUB_ENV"
+          echo "Cache key: src-cache/${TARGET_PLATFORM}-${TARGET_ARCH}/${DEPSHASH}.tar.zst"
 
       - name: Configure AWS credentials from OIDC
         if: ${{ inputs.use_src_cache }}
@@ -172,23 +174,36 @@ jobs:
             echo "Src cache disabled for this run"
             exit 0
           fi
-          if aws s3api head-object --bucket "$CACHE_BUCKET" --key "$CACHE_KEY" >/dev/null 2>&1; then
-            echo "hit=true" >> "$GITHUB_OUTPUT"
-            echo "Cache HIT for $CACHE_KEY"
-          else
-            ORPHAN=$(aws s3 ls "s3://$CACHE_BUCKET/${CACHE_KEY}.upload-" 2>/dev/null \
-              | sort | tail -1 | awk '{print $4}' || true)
-            if [ -n "$ORPHAN" ]; then
-              ORPHAN="$(dirname "$CACHE_KEY")/$ORPHAN"
-              echo "Adopting orphaned upload $ORPHAN"
-              aws s3 mv "s3://$CACHE_BUCKET/$ORPHAN" "s3://$CACHE_BUCKET/$CACHE_KEY"
+          try_key() {
+            local key="$1"
+            if aws s3api head-object --bucket "$CACHE_BUCKET" --key "$key" >/dev/null 2>&1; then
+              echo "CACHE_KEY=$key" >> "$GITHUB_ENV"
               echo "hit=true" >> "$GITHUB_OUTPUT"
-              echo "Cache HIT (recovered orphan) for $CACHE_KEY"
-            else
-              echo "hit=false" >> "$GITHUB_OUTPUT"
-              echo "Cache MISS for $CACHE_KEY"
+              echo "Cache HIT for $key"
+              return 0
             fi
+            local orphan
+            orphan=$(aws s3 ls "s3://$CACHE_BUCKET/${key}.upload-" 2>/dev/null \
+              | sort | tail -1 | awk '{print $4}' || true)
+            if [ -n "$orphan" ]; then
+              orphan="$(dirname "$key")/$orphan"
+              echo "Adopting orphaned upload $orphan"
+              aws s3 mv "s3://$CACHE_BUCKET/$orphan" "s3://$CACHE_BUCKET/$key"
+              echo "CACHE_KEY=$key" >> "$GITHUB_ENV"
+              echo "hit=true" >> "$GITHUB_OUTPUT"
+              echo "Cache HIT (recovered orphan) for $key"
+              return 0
+            fi
+            return 1
+          }
+          if try_key "$CACHE_KEY"; then
+            exit 0
           fi
+          if [ "$TARGET_ARCH" = "arm64" ] && try_key "$LEGACY_CACHE_KEY"; then
+            exit 0
+          fi
+          echo "hit=false" >> "$GITHUB_OUTPUT"
+          echo "Cache MISS for $CACHE_KEY"
 
       - name: Init build config
         run: |
