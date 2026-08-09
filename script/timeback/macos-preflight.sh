@@ -48,6 +48,17 @@ echo "sdk:       ${SDK_VER}"
 echo "sdkroot:   ${SDKROOT}"
 test -d "$SDKROOT" || { echo "ERROR: SDKROOT missing"; exit 1; }
 
+# GN/Electron use target_cpu=x64; Apple clang wants -arch x86_64.
+case "${TARGET_ARCH}" in
+  x64) CLANG_ARCH="x86_64" ;;
+  arm64) CLANG_ARCH="arm64" ;;
+  *)
+    echo "ERROR: unsupported TARGET_ARCH=${TARGET_ARCH}"
+    exit 1
+    ;;
+esac
+echo "clang_arch: ${CLANG_ARCH} (from TARGET_ARCH=${TARGET_ARCH})"
+
 CLANG="$(xcrun --find clang)"
 LD="$(xcrun --find ld)"
 echo "clang:     ${CLANG} ($(${CLANG} --version | head -1))"
@@ -58,11 +69,11 @@ trap 'rm -rf "$TMPDIR_PROBE"' EXIT
 cat >"${TMPDIR_PROBE}/probe.c" <<'EOF'
 int main(void) { return 0; }
 EOF
-"${CLANG}" -isysroot "$SDKROOT" -arch "${TARGET_ARCH}" \
+"${CLANG}" -isysroot "$SDKROOT" -arch "${CLANG_ARCH}" \
   "${TMPDIR_PROBE}/probe.c" -o "${TMPDIR_PROBE}/probe" \
   -framework Foundation -framework AppKit -framework Metal -framework WebKit
 file "${TMPDIR_PROBE}/probe"
-echo "link probe OK (Foundation/AppKit/Metal/WebKit + arch ${TARGET_ARCH})"
+echo "link probe OK (Foundation/AppKit/Metal/WebKit + arch ${CLANG_ARCH})"
 
 echo "== Framework presence =="
 for fw in AppKit Foundation Metal WebKit CoreGraphics CoreMedia AVFoundation \
@@ -110,6 +121,20 @@ if [ "${PROFILE_COUNT}" -lt 1 ]; then
   exit 1
 fi
 echo "PGO profile blobs: ${PROFILE_COUNT}"
+
+echo "== Host toolchain sanity =="
+GN_BIN="src/buildtools/mac/gn"
+if [ ! -x "$GN_BIN" ]; then
+  echo "ERROR: missing ${GN_BIN}"
+  exit 1
+fi
+echo "gn binary: $(file "$GN_BIN")"
+if ! "$GN_BIN" --version; then
+  echo "ERROR: ${GN_BIN} is not runnable on this host"
+  echo "Likely restored an src-cache built for a different CPU (arm64 vs x64)."
+  echo "Caches must be keyed per host arch (macos-arm64 / macos-x64)."
+  exit 1
+fi
 
 echo "== GN generate (no compile) =="
 export CHROMIUM_BUILDTOOLS_PATH="${CHROMIUM_BUILDTOOLS_PATH:-$(pwd)/src/buildtools}"
