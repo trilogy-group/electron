@@ -48,13 +48,38 @@ env:
   TARGET_PLATFORM: macos
 
 jobs:
+  # Job-level `if` cannot reference `matrix` (Actions parse error). Build the
+  # include list here so each selected arch becomes a real matrix row.
+  select-runners:
+    name: Select preflight runners
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        env:
+          RUN_ARM64: ${{ inputs.run_arm64 }}
+          RUN_X64: ${{ inputs.run_x64 }}
+        run: |
+          set -euo pipefail
+          rows=()
+          if [ "$RUN_ARM64" = "true" ]; then
+            rows+=('{"arch":"arm64","runner":"macos-latest-xlarge","ninja_j":"4"}')
+          fi
+          if [ "$RUN_X64" = "true" ]; then
+            rows+=('{"arch":"x64","runner":"macos-latest-large","ninja_j":"11"}')
+          fi
+          if [ "${#rows[@]}" -eq 0 ]; then
+            echo "Select at least one of run_arm64 / run_x64" >&2
+            exit 1
+          fi
+          joined=$(IFS=,; echo "${rows[*]}")
+          echo "matrix={\"include\":[${joined}]}" >> "$GITHUB_OUTPUT"
+          echo "Selected: ${joined}"
+
   preflight:
     name: Preflight ${{ matrix.arch }} (${{ matrix.runner }})
-    if: >-
-      ${{
-        (matrix.arch == 'arm64' && inputs.run_arm64) ||
-        (matrix.arch == 'x64' && inputs.run_x64)
-      }}
+    needs: select-runners
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     permissions:
@@ -62,14 +87,7 @@ jobs:
       id-token: write
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            runner: macos-latest-xlarge
-            ninja_j: '4'
-          - arch: x64
-            runner: macos-latest-large
-            ninja_j: '11'
+      matrix: ${{ fromJson(needs.select-runners.outputs.matrix) }}
     env:
       TARGET_ARCH: ${{ matrix.arch }}
       NINJA_J: ${{ matrix.ninja_j }}
