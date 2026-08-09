@@ -57,13 +57,38 @@ env:
   OUT_DIR: src/out/Release
 
 jobs:
+  select-mac-runners:
+    name: Select macOS builders
+    if: ${{ inputs.build_mac_arm64 || inputs.build_mac_x64 }}
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        env:
+          BUILD_ARM64: ${{ inputs.build_mac_arm64 }}
+          BUILD_X64: ${{ inputs.build_mac_x64 }}
+        run: |
+          set -euo pipefail
+          rows=()
+          if [ "$BUILD_ARM64" = "true" ]; then
+            rows+=('{"arch":"arm64","runner":"macos-latest-xlarge","ninja_j":"4"}')
+          fi
+          if [ "$BUILD_X64" = "true" ]; then
+            rows+=('{"arch":"x64","runner":"macos-latest-large","ninja_j":"11"}')
+          fi
+          if [ "${#rows[@]}" -eq 0 ]; then
+            echo "No macOS arches selected" >&2
+            exit 1
+          fi
+          joined=$(IFS=,; echo "${rows[*]}")
+          echo "matrix={\"include\":[${joined}]}" >> "$GITHUB_OUTPUT"
+          echo "Selected: ${joined}"
+
   build-mac:
     name: Build macOS ${{ matrix.arch }}
-    if: >-
-      ${{
-        (matrix.arch == 'arm64' && inputs.build_mac_arm64) ||
-        (matrix.arch == 'x64' && inputs.build_mac_x64)
-      }}
+    needs: select-mac-runners
+    if: ${{ inputs.build_mac_arm64 || inputs.build_mac_x64 }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 720
     permissions:
@@ -71,14 +96,7 @@ jobs:
       id-token: write
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            runner: macos-latest-xlarge
-            ninja_j: '4'
-          - arch: x64
-            runner: macos-latest-large
-            ninja_j: '11'
+      matrix: ${{ fromJson(needs.select-mac-runners.outputs.matrix) }}
     env:
       TARGET_PLATFORM: macos
       TARGET_ARCH: ${{ matrix.arch }}
