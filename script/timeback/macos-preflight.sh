@@ -87,18 +87,29 @@ grep -E 'fix_(devtools_fetch|httpcache_done|videocapture_host|win_videocapture)'
   src/electron/patches/chromium/.patches
 
 echo "== PGO profiles =="
-# Release GN imports chrome_pgo_phase=2; missing profiles fail late in the compile.
-PGO_DIR="src/chrome/build/pgo_profiles"
-if [ ! -d "$PGO_DIR" ] || [ -z "$(ls -A "$PGO_DIR" 2>/dev/null || true)" ]; then
-  echo "PGO dir empty/missing — downloading for ${TARGET_PLATFORM}-${TARGET_ARCH}"
-  python3 src/electron/script/pgo/download-profiles.py \
-    --targets "${TARGET_PLATFORM}-${TARGET_ARCH},v8-builtins"
-fi
-ls -lh "$PGO_DIR" | head -20
-test -n "$(ls -A "$PGO_DIR" 2>/dev/null || true)" || {
-  echo "ERROR: PGO profiles still missing after download"
+# Electron stores release PGO under src/electron/build/pgo_profiles (state files +
+# CDN blobs). Chromium's src/chrome/build/pgo_profiles is the wrong tree — the
+# build resolves Electron state files via
+# build_resolve_pgo_profiles_from_electron_state_files.patch.
+PGO_DIR="src/electron/build/pgo_profiles"
+python3 src/electron/script/pgo/download-profiles.py \
+  --targets "${TARGET_PLATFORM}-${TARGET_ARCH},v8-builtins"
+test -d "$PGO_DIR" || {
+  echo "ERROR: PGO dir missing at ${PGO_DIR}"
   exit 1
 }
+ls -lh "$PGO_DIR" | head -30
+# Require the arch state file and at least one downloaded profile blob.
+test -f "${PGO_DIR}/${TARGET_PLATFORM}-${TARGET_ARCH}.pgo.txt" || {
+  echo "ERROR: missing PGO state file for ${TARGET_PLATFORM}-${TARGET_ARCH}"
+  exit 1
+}
+PROFILE_COUNT="$(find "$PGO_DIR" -maxdepth 1 \( -name '*.profdata' -o -name '*.profile' \) | wc -l | tr -d ' ')"
+if [ "${PROFILE_COUNT}" -lt 1 ]; then
+  echo "ERROR: no PGO profile blobs under ${PGO_DIR}"
+  exit 1
+fi
+echo "PGO profile blobs: ${PROFILE_COUNT}"
 
 echo "== GN generate (no compile) =="
 export CHROMIUM_BUILDTOOLS_PATH="${CHROMIUM_BUILDTOOLS_PATH:-$(pwd)/src/buildtools}"
