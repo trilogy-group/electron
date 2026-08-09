@@ -48,6 +48,17 @@ echo "sdk:       ${SDK_VER}"
 echo "sdkroot:   ${SDKROOT}"
 test -d "$SDKROOT" || { echo "ERROR: SDKROOT missing"; exit 1; }
 
+# GN/Electron use target_cpu=x64; Apple clang wants -arch x86_64.
+case "${TARGET_ARCH}" in
+  x64) CLANG_ARCH="x86_64" ;;
+  arm64) CLANG_ARCH="arm64" ;;
+  *)
+    echo "ERROR: unsupported TARGET_ARCH=${TARGET_ARCH}"
+    exit 1
+    ;;
+esac
+echo "clang_arch: ${CLANG_ARCH} (from TARGET_ARCH=${TARGET_ARCH})"
+
 CLANG="$(xcrun --find clang)"
 LD="$(xcrun --find ld)"
 echo "clang:     ${CLANG} ($(${CLANG} --version | head -1))"
@@ -58,11 +69,11 @@ trap 'rm -rf "$TMPDIR_PROBE"' EXIT
 cat >"${TMPDIR_PROBE}/probe.c" <<'EOF'
 int main(void) { return 0; }
 EOF
-"${CLANG}" -isysroot "$SDKROOT" -arch "${TARGET_ARCH}" \
+"${CLANG}" -isysroot "$SDKROOT" -arch "${CLANG_ARCH}" \
   "${TMPDIR_PROBE}/probe.c" -o "${TMPDIR_PROBE}/probe" \
   -framework Foundation -framework AppKit -framework Metal -framework WebKit
 file "${TMPDIR_PROBE}/probe"
-echo "link probe OK (Foundation/AppKit/Metal/WebKit + arch ${TARGET_ARCH})"
+echo "link probe OK (Foundation/AppKit/Metal/WebKit + arch ${CLANG_ARCH})"
 
 echo "== Framework presence =="
 for fw in AppKit Foundation Metal WebKit CoreGraphics CoreMedia AVFoundation \
