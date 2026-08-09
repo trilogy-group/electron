@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Unzip a freshly packaged Electron dist zip and prove it is a good binary before
-# it can be published: it must report our version and carry the fetch-intercept
-# patch set. A bad binary fails the same run instead of shipping.
+# it can be published: it must report our override version and the Chromium 150
+# line pinned by DEPS (see smoke-test-binary.js). A bad binary fails here instead
+# of shipping.
 #
 # Usage: smoke-test.sh <artifact-zip> <macos|windows> <expected-version>
 set -euo pipefail
