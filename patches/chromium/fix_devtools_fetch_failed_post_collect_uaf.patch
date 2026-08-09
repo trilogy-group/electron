@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tarun Lalwani <tarunlalwani@gmail.com>
+Date: Wed, 29 Jul 2026 14:30:00 +0000
+Subject: fix: UAF in DevTools Fetch Response interception for failed POSTs
+
+Temporary: upstream Chromium fix for InterceptionJob NotifyClient /
+RequestBodyCollector use-after-free when Fetch.enable (Response) + failed
+POST with body re-entrantly continues during synchronous Collect.
+
+Intended to be removed once https://crbug.com/533483477 /
+https://chromium-review.googlesource.com/c/chromium/src/+/8084482 lands
+in the Chromium revision Electron rolls.
+
+Share: https://github.com/tarunlalwani/chromium/tree/share/devtools-fetch-response-failed-post-patch
+
+---
+
+diff --git a/content/browser/devtools/devtools_url_loader_interceptor.cc b/content/browser/devtools/devtools_url_loader_interceptor.cc
+index 36b710427ae06..f4ac2c1364d1c 100644
+--- a/content/browser/devtools/devtools_url_loader_interceptor.cc
++++ b/content/browser/devtools/devtools_url_loader_interceptor.cc
+@@ -1728,8 +1728,8 @@ void InterceptionJob::FetchCookies(base::OnceClosure callback) {
+ 
+   cookie_manager_->GetCookieList(
+       request.url, options, net::CookiePartitionKeyCollection(),
+-      base::BindOnce(&InterceptionJob::OnGotCookies, base::Unretained(this),
+-                     std::move(callback)));
++      base::BindOnce(&InterceptionJob::OnGotCookies,
++                     weak_ptr_factory_.GetWeakPtr(), std::move(callback)));
+ }
+ 
+ void InterceptionJob::NotifyClient(
+@@ -1751,19 +1751,36 @@ void InterceptionJob::NotifyClient(
+       (have_cookies == want_cookies ? 0 : 1) +
+       (have_request_bodies == want_request_bodies ? 0 : 1);
+ 
++  // RequestBodyCollector::Collect (bytes) and a 0-count BarrierClosure may run
++  // completion synchronously. A re-entrant Fetch.continueResponse can
++  // Shutdown()/delete this before we return to member assignments below.
++  // WeakPtr binds drop late callbacks; the `self` checks skip use-after-free
++  // on this stack frame. Header-client paths already use WeakPtr similarly.
++  base::WeakPtr<InterceptionJob> self = weak_ptr_factory_.GetWeakPtr();
+   base::RepeatingClosure closure = BarrierClosure(
+       pending_callback_count,
+-      base::BindOnce(&InterceptionJob::CompleteNotifyingClient,
+-                     base::Unretained(this), std::move(request_info)));
++      base::BindOnce(&InterceptionJob::CompleteNotifyingClient, self,
++                     std::move(request_info)));
++  if (!self) {
++    return;
++  }
+   if (have_cookies != want_cookies) {
+     FetchCookies(closure);
++    if (!self) {
++      return;
++    }
+   }
+   if (have_request_bodies != want_request_bodies) {
+     CHECK(!request_body_collector_);
+-    request_body_collector_ = RequestBodyCollector::Collect(
+-        *request.request_body,
+-        base::BindOnce(&InterceptionJob::OnGotRequestBodies,
+-                       base::Unretained(this), closure));
++    std::unique_ptr<RequestBodyCollector> collector =
++        RequestBodyCollector::Collect(
++            *request.request_body,
++            base::BindOnce(&InterceptionJob::OnGotRequestBodies, self,
++                           closure));
++    if (!self) {
++      return;
++    }
++    request_body_collector_ = std::move(collector);
+   }
+ }
+ 

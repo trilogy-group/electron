@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tarun Lalwani <tarunlalwani@gmail.com>
+Date: Wed, 29 Jul 2026 14:30:00 +0000
+Subject: fix: do not restart done_headers_ HttpCache tx on doom race
+
+Temporary: prevent CHECK(!done_headers_create_new_entry_) when
+DoDoomEntryComplete(ERR_CACHE_RACE) restarts a transaction that still has
+done_headers_create_new_entry_ set.
+
+Related: crbug 428819090, 433619513.
+Share: https://github.com/tarunlalwani/chromium/tree/share/httpcache-done-headers-restart-check-patch
+
+---
+
+diff --git a/net/http/http_cache_transaction.cc b/net/http/http_cache_transaction.cc
+index 1d20ef849fc16..5df977226ffc1 100644
+--- a/net/http/http_cache_transaction.cc
++++ b/net/http/http_cache_transaction.cc
+@@ -1385,9 +1385,34 @@ int HttpCache::Transaction::DoDoomEntryComplete(int result) {
+   net_log_.EndEventWithNetErrorCode(NetLogEventType::HTTP_CACHE_DOOM_ENTRY,
+                                     result);
+   cache_pending_ = false;
+-  TransitionToState(result == ERR_CACHE_RACE
+-                        ? STATE_HEADERS_PHASE_CANNOT_PROCEED
+-                        : STATE_CREATE_ENTRY);
++
++  if (result == ERR_CACHE_RACE) {
++    // TODO(crbug.com/433619513): Remove this histogram in December 2025.
++    base::UmaHistogramBoolean(
++        "HttpCache.DoomEntryCompleteWithRaceDoneHeadersValue",
++        done_headers_create_new_entry_);
++
++    if (done_headers_create_new_entry_) {
++      // The network request has been sent and a response received which
++      // requires us to replace the existing entry, but we hit a race when we
++      // tried to delete the existing entry. To be on the safe side, stop trying
++      // to use the cache and let the client read the response from the network
++      // directly. This is a very rare event so the loss of cache hits is
++      // acceptable.
++      mode_ = NONE;
++      CHECK(network_trans_);
++      CHECK(!entry_);
++      CHECK(!new_entry_);
++      TransitionToState(STATE_NONE);
++      return OK;
++    }
++
++    // This will restart the transaction.
++    TransitionToState(STATE_HEADERS_PHASE_CANNOT_PROCEED);
++    return OK;
++  }
++
++  TransitionToState(STATE_CREATE_ENTRY);
+   return OK;
+ }
+ 
