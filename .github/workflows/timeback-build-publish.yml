@@ -306,7 +306,9 @@ jobs:
 
   build-win:
     if: ${{ inputs.build_win }}
-    name: Build Windows ${{ matrix.arch }}
+    # Do not put ${{ matrix.* }} in the job name: when build_win is false the
+    # matrix never expands and Actions shows the literal expression in the UI.
+    name: Build Windows
     runs-on: wseng-windows-latest-32vcpu
     timeout-minutes: 720
     strategy:
@@ -326,6 +328,7 @@ jobs:
     steps:
       - name: Runner specs
         run: |
+          echo "arch:      ${TARGET_ARCH}"
           echo "runner:    $RUNNER_NAME ($RUNNER_OS/$RUNNER_ARCH)"
           powershell -NoProfile -Command "\
             \$cpu = Get-CimInstance Win32_Processor | Select-Object -First 1; \
