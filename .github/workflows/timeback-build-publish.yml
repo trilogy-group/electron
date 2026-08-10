@@ -7,8 +7,8 @@
 #
 # Src-cache keyed by *host* arch. Out-cache checkpoints out/Release so a 6h
 # hard kill resumes instead of restarting (~79k edges for cross x64).
-# Speed GN args (symbol_level=0, chrome_pgo_phase=0) keep TimeBack builds
-# under/near the cap; see script/timeback/build.sh.
+# chrome_pgo_phase=0 speeds the build without stripping symbols (required for
+# crash report symbolication). Never set symbol_level=0 on shipping builds.
 #
 # Publish destinations:
 #   1) GitHub Releases  → ELECTRON_MIRROR / @electron/get

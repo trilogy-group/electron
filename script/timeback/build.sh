@@ -11,11 +11,10 @@ set -euo pipefail
 
 gn_extra_args() {
   # override_electron_version stamps our npm/release version.
-  # symbol_level=0 + chrome_pgo_phase=0 shave substantial compile/link time so
-  # macOS larger-runner jobs can fit under GitHub's hard 6h cap (cross x64 was
-  # ~2h short at 59k/79k). Crash-fix semantics are unchanged; re-enable PGO
-  # later if we need official-perf parity.
-  local args="override_electron_version=\"${ELECTRON_VERSION}\" symbol_level=0 blink_symbol_level=0 v8_symbol_level=0 chrome_pgo_phase=0"
+  # Keep default symbol_level (official builds use level 1) so Sentry/crashpad
+  # can symbolicate. chrome_pgo_phase=0 only skips PGO optimize — it does not
+  # strip debug/symbol data needed for crash reports.
+  local args="override_electron_version=\"${ELECTRON_VERSION}\" chrome_pgo_phase=0"
   if [ -n "${GN_CC_WRAPPER:-}" ]; then
     args="$args cc_wrapper=\"${GN_CC_WRAPPER}\""
   fi
