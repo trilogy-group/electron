@@ -33,9 +33,9 @@ snapshot() {
 
 gn_extra_args() {
   # override_electron_version stamps our npm/release version.
-  # symbol_level=0 + chrome_pgo_phase=0: see build.sh — needed to approach the
-  # 6h macOS larger-runner cap for cross darwin-x64.
-  local args="override_electron_version=\"${ELECTRON_VERSION}\" symbol_level=0 blink_symbol_level=0 v8_symbol_level=0 chrome_pgo_phase=0"
+  # Do NOT set symbol_level=0 — TimeBack crash reports need symbolication.
+  # chrome_pgo_phase=0 skips PGO only (see build.sh).
+  local args="override_electron_version=\"${ELECTRON_VERSION}\" chrome_pgo_phase=0"
   if [ -n "${GN_CC_WRAPPER:-}" ]; then
     args="$args cc_wrapper=\"${GN_CC_WRAPPER}\""
   fi
