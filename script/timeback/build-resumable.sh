@@ -16,16 +16,13 @@ set -uo pipefail
 # output, so a checkpoint is cheap and protects work that would otherwise be
 # wholly unprotected; later checkpoints are deltas, so a wider spacing keeps the
 # pause overhead down without ever risking more than MAX_CHECKPOINT_SECONDS.
-readonly FIRST_CHECKPOINT_SECONDS="${FIRST_CHECKPOINT_SECONDS:-300}"
-readonly MAX_CHECKPOINT_SECONDS="${MAX_CHECKPOINT_SECONDS:-900}"
+# Checkpoints: first at 10m, then widen up to 20m so a 6h hard kill loses at
+# most one interval of compile (upload pause is ~1m).
+readonly FIRST_CHECKPOINT_SECONDS="${FIRST_CHECKPOINT_SECONDS:-600}"
+readonly MAX_CHECKPOINT_SECONDS="${MAX_CHECKPOINT_SECONDS:-1200}"
 readonly MAX_PASSES="${MAX_PASSES:-80}"
 readonly POLL_SECONDS=15
-# Measured: a pause plus delta upload costs about a minute, so checkpointing every
-# 15 minutes trades ~7% of build time for a 15-minute worst case on a hard kill.
 readonly HEARTBEAT_SECONDS="${HEARTBEAT_SECONDS:-300}"
-# Ninja prints a line per edge, which for ~100k edges overruns the log limits and
-# leaves the Actions UI hours behind. Progress is thinned to one line per interval;
-# diagnostics still come through in full.
 readonly PROGRESS_INTERVAL_SECONDS="${PROGRESS_INTERVAL_SECONDS:-10}"
 readonly PAUSED_RC=124
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,9 +32,10 @@ snapshot() {
 }
 
 gn_extra_args() {
-  # override_electron_version makes the produced zip/npm version ours, not the
-  # upstream tag the branch was cut from.
-  local args="override_electron_version=\"${ELECTRON_VERSION}\""
+  # override_electron_version stamps our npm/release version.
+  # symbol_level=0 + chrome_pgo_phase=0: see build.sh — needed to approach the
+  # 6h macOS larger-runner cap for cross darwin-x64.
+  local args="override_electron_version=\"${ELECTRON_VERSION}\" symbol_level=0 blink_symbol_level=0 v8_symbol_level=0 chrome_pgo_phase=0"
   if [ -n "${GN_CC_WRAPPER:-}" ]; then
     args="$args cc_wrapper=\"${GN_CC_WRAPPER}\""
   fi

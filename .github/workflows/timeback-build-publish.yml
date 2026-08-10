@@ -2,12 +2,13 @@
 #
 # macOS (both on Apple Silicon macos-latest-xlarge — Intel large is too slow
 # for the 6h Actions cap):
-#   arm64 → native,  NINJA_J=4
-#   x64   → cross-compile (target_cpu=x64), NINJA_J=4
+#   arm64 → native,  NINJA_J=5
+#   x64   → cross-compile (target_cpu=x64), NINJA_J=5
 #
-# Src-cache is keyed by *host* arch (gn/clang), not target_cpu.
-# Caching: S3 src-cache only (Chromium tree). No out-cache / resumable
-# checkpoint complexity.
+# Src-cache keyed by *host* arch. Out-cache checkpoints out/Release so a 6h
+# hard kill resumes instead of restarting (~79k edges for cross x64).
+# Speed GN args (symbol_level=0, chrome_pgo_phase=0) keep TimeBack builds
+# under/near the cap; see script/timeback/build.sh.
 #
 # Publish destinations:
 #   1) GitHub Releases  → ELECTRON_MIRROR / @electron/get
@@ -27,11 +28,11 @@ on:
         type: boolean
         default: true
       build_mac_arm64:
-        description: 'Build macOS arm64 on macos-latest-xlarge (-j4, native)'
+        description: 'Build macOS arm64 on macos-latest-xlarge (-j5, native)'
         type: boolean
         default: true
       build_mac_x64:
-        description: 'Build macOS x64 on macos-latest-xlarge (-j4, cross-compile)'
+        description: 'Build macOS x64 on macos-latest-xlarge (-j5, cross-compile)'
         type: boolean
         default: true
       build_win:
@@ -40,6 +41,10 @@ on:
         default: false
       use_src_cache:
         description: 'Restore/save the Chromium src cache in S3'
+        type: boolean
+        default: true
+      use_out_cache:
+        description: 'Checkpoint out/Release to S3 so a 6h kill can resume'
         type: boolean
         default: true
 
@@ -57,6 +62,10 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   AWS_MAX_ATTEMPTS: '5'
   OUT_DIR: src/out/Release
+  USE_OUT_CACHE: ${{ inputs.use_out_cache }}
+  # First checkpoint ~10m, then up to ~20m (see build-resumable.sh).
+  MAX_CHECKPOINT_SECONDS: '1200'
+  FIRST_CHECKPOINT_SECONDS: '600'
 
 jobs:
   select-mac-runners:
@@ -74,12 +83,12 @@ jobs:
           set -euo pipefail
           rows=()
           if [ "$BUILD_ARM64" = "true" ]; then
-            rows+=('{"arch":"arm64","runner":"macos-latest-xlarge","ninja_j":"4"}')
+            rows+=('{"arch":"arm64","runner":"macos-latest-xlarge","ninja_j":"5"}')
           fi
           if [ "$BUILD_X64" = "true" ]; then
             # Same M2 xlarge as arm64: Intel macos-latest-large cannot finish
             # Chromium within the 6h larger-runner cap (~61% @ 6h measured).
-            rows+=('{"arch":"x64","runner":"macos-latest-xlarge","ninja_j":"4"}')
+            rows+=('{"arch":"x64","runner":"macos-latest-xlarge","ninja_j":"5"}')
           fi
           if [ "${#rows[@]}" -eq 0 ]; then
             echo "No macOS arches selected" >&2
@@ -167,10 +176,12 @@ jobs:
           echo "HOST_ARCH_KEY=$HOST_ARCH_KEY" >> "$GITHUB_ENV"
           echo "CACHE_KEY=src-cache/${TARGET_PLATFORM}-${HOST_ARCH_KEY}/${DEPSHASH}.tar.zst" >> "$GITHUB_ENV"
           echo "LEGACY_CACHE_KEY=src-cache/${TARGET_PLATFORM}/${DEPSHASH}.tar.zst" >> "$GITHUB_ENV"
+          # Out-cache is per host+target so arm64 native and x64 cross never clash.
+          echo "OUT_CACHE_PREFIX=out-cache/${TARGET_PLATFORM}-${HOST_ARCH_KEY}-target-${TARGET_ARCH}/${DEPSHASH}/" >> "$GITHUB_ENV"
           echo "Cache key: src-cache/${TARGET_PLATFORM}-${HOST_ARCH_KEY}/${DEPSHASH}.tar.zst (target=${TARGET_ARCH})"
 
       - name: Configure AWS credentials from OIDC
-        if: ${{ inputs.use_src_cache }}
+        if: ${{ inputs.use_src_cache || inputs.use_out_cache }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_ROLE_NAME }}
@@ -289,10 +300,19 @@ jobs:
       - name: Add CHROMIUM_BUILDTOOLS_PATH to env
         run: echo "CHROMIUM_BUILDTOOLS_PATH=$(pwd)/src/buildtools" >> "$GITHUB_ENV"
 
-      - name: Build Electron (release)
-        run: bash src/electron/script/timeback/build.sh
+      - name: Restore out cache
+        if: ${{ inputs.use_out_cache }}
+        run: bash src/electron/script/timeback/out-cache.sh restore
+
+      - name: Build Electron (release, resumable)
+        run: bash src/electron/script/timeback/build-resumable.sh
+
+      - name: Checkpoint out dir (cancelled / timed out)
+        if: ${{ cancelled() && inputs.use_out_cache }}
+        run: bash src/electron/script/timeback/out-cache.sh save
 
       - name: Package dist.zip
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           OUT="$OUT_DIR"
@@ -306,6 +326,7 @@ jobs:
           echo "SMOKE_ARTIFACT=artifacts/$ARTIFACT" >> "$GITHUB_ENV"
 
       - name: Smoke test packaged binary
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           # Cross-built x64 Electron on Apple Silicon needs Rosetta for launch.
@@ -316,6 +337,7 @@ jobs:
           bash src/electron/script/timeback/smoke-test.sh "$SMOKE_ARTIFACT" macos "$ELECTRON_VERSION"
 
       - name: Upload mac artifact
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: electron-darwin-${{ matrix.arch }}
