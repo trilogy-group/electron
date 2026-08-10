@@ -1,12 +1,8 @@
-# TimeBack: non-compiling macOS dual-runner preflight.
+# TimeBack: non-compiling macOS dual-arch preflight.
 #
-# Proves both GitHub-hosted Mac builders can sync (or restore src-cache),
-# download PGO, run gn gen, and dry-run `electron:electron_dist_zip` before we
-# spend 6–10 hours on a real compile.
-#
-# Runners:
-#   arm64 → macos-latest-xlarge (Apple Silicon, ~5 CPU / 14 GiB) — NINJA_J=4
-#   x64   → macos-latest-large  (Intel, ~12 CPU / 30 GiB)       — NINJA_J=11
+# Both arches on macos-latest-xlarge (Apple Silicon):
+#   arm64 → native gn gen / dry-run
+#   x64   → cross-compile target_cpu=x64 gn gen / dry-run
 #
 # Does NOT compile. Does NOT publish.
 
@@ -24,11 +20,11 @@ on:
         type: boolean
         default: true
       run_arm64:
-        description: 'Preflight macos-latest-xlarge / arm64'
+        description: 'Preflight arm64 native on macos-latest-xlarge'
         type: boolean
         default: true
       run_x64:
-        description: 'Preflight macos-latest-large / x64'
+        description: 'Preflight x64 cross-compile on macos-latest-xlarge'
         type: boolean
         default: true
 
@@ -67,7 +63,7 @@ jobs:
             rows+=('{"arch":"arm64","runner":"macos-latest-xlarge","ninja_j":"4"}')
           fi
           if [ "$RUN_X64" = "true" ]; then
-            rows+=('{"arch":"x64","runner":"macos-latest-large","ninja_j":"11"}')
+            rows+=('{"arch":"x64","runner":"macos-latest-xlarge","ninja_j":"4"}')
           fi
           if [ "${#rows[@]}" -eq 0 ]; then
             echo "Select at least one of run_arm64 / run_x64" >&2
@@ -131,12 +127,16 @@ jobs:
           node src/electron/script/generate-deps-hash.js
           DEPSHASH="v2-src-cache-$(cat src/electron/.depshash)"
           echo "DEPSHASH=$DEPSHASH" >> "$GITHUB_ENV"
-          # Host toolchain binaries (gn, clang) are arch-specific. An arm64-built
-          # macos src-cache cannot be restored on Intel (Bad CPU type on gn).
-          echo "CACHE_KEY=src-cache/${TARGET_PLATFORM}-${TARGET_ARCH}/${DEPSHASH}.tar.zst" >> "$GITHUB_ENV"
-          # Pre-arch-split key; arm64-only migration fallback.
+          # Key by host arch (cross x64 on arm64 reuses macos-arm64/ toolchain).
+          case "${RUNNER_ARCH}" in
+            ARM64) HOST_ARCH_KEY=arm64 ;;
+            X64) HOST_ARCH_KEY=x64 ;;
+            *) echo "Unsupported RUNNER_ARCH=${RUNNER_ARCH}" >&2; exit 1 ;;
+          esac
+          echo "HOST_ARCH_KEY=$HOST_ARCH_KEY" >> "$GITHUB_ENV"
+          echo "CACHE_KEY=src-cache/${TARGET_PLATFORM}-${HOST_ARCH_KEY}/${DEPSHASH}.tar.zst" >> "$GITHUB_ENV"
           echo "LEGACY_CACHE_KEY=src-cache/${TARGET_PLATFORM}/${DEPSHASH}.tar.zst" >> "$GITHUB_ENV"
-          echo "Cache key: src-cache/${TARGET_PLATFORM}-${TARGET_ARCH}/${DEPSHASH}.tar.zst"
+          echo "Cache key: src-cache/${TARGET_PLATFORM}-${HOST_ARCH_KEY}/${DEPSHASH}.tar.zst (target=${TARGET_ARCH})"
 
       - name: Configure AWS credentials from OIDC
         if: ${{ inputs.use_src_cache }}
@@ -180,8 +180,7 @@ jobs:
           if try_key "$CACHE_KEY"; then
             exit 0
           fi
-          # Only arm64 may reuse the pre-split macos/ blob (it was produced on arm64).
-          if [ "$TARGET_ARCH" = "arm64" ] && try_key "$LEGACY_CACHE_KEY"; then
+          if [ "$HOST_ARCH_KEY" = "arm64" ] && try_key "$LEGACY_CACHE_KEY"; then
             exit 0
           fi
           echo "hit=false" >> "$GITHUB_OUTPUT"
