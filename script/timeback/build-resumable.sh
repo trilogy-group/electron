@@ -6,7 +6,8 @@
 # target, or a job timeout replays only the work since the last snapshot.
 #
 # Env: ELECTRON_VERSION (required), GN_CC_WRAPPER, SNAPSHOT_INTERVAL_SECONDS,
-#      MAX_PASSES, plus everything out-cache.sh needs.
+#      MAX_PASSES, NINJA_J (optional; forwarded as `e build -j N`), plus
+#      everything out-cache.sh needs.
 set -uo pipefail
 
 : "${ELECTRON_VERSION:?ELECTRON_VERSION is required}"
@@ -15,16 +16,13 @@ set -uo pipefail
 # output, so a checkpoint is cheap and protects work that would otherwise be
 # wholly unprotected; later checkpoints are deltas, so a wider spacing keeps the
 # pause overhead down without ever risking more than MAX_CHECKPOINT_SECONDS.
-readonly FIRST_CHECKPOINT_SECONDS="${FIRST_CHECKPOINT_SECONDS:-300}"
-readonly MAX_CHECKPOINT_SECONDS="${MAX_CHECKPOINT_SECONDS:-900}"
+# Checkpoints: first at 10m, then widen up to 20m so a 6h hard kill loses at
+# most one interval of compile (upload pause is ~1m).
+readonly FIRST_CHECKPOINT_SECONDS="${FIRST_CHECKPOINT_SECONDS:-600}"
+readonly MAX_CHECKPOINT_SECONDS="${MAX_CHECKPOINT_SECONDS:-1200}"
 readonly MAX_PASSES="${MAX_PASSES:-80}"
 readonly POLL_SECONDS=15
-# Measured: a pause plus delta upload costs about a minute, so checkpointing every
-# 15 minutes trades ~7% of build time for a 15-minute worst case on a hard kill.
 readonly HEARTBEAT_SECONDS="${HEARTBEAT_SECONDS:-300}"
-# Ninja prints a line per edge, which for ~100k edges overruns the log limits and
-# leaves the Actions UI hours behind. Progress is thinned to one line per interval;
-# diagnostics still come through in full.
 readonly PROGRESS_INTERVAL_SECONDS="${PROGRESS_INTERVAL_SECONDS:-10}"
 readonly PAUSED_RC=124
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,9 +32,10 @@ snapshot() {
 }
 
 gn_extra_args() {
-  # override_electron_version makes the produced zip/npm version ours, not the
-  # upstream tag the branch was cut from.
-  local args="override_electron_version=\"${ELECTRON_VERSION}\""
+  # override_electron_version stamps our npm/release version.
+  # symbol_level=0 + chrome_pgo_phase=0: see build.sh — needed to approach the
+  # 6h macOS larger-runner cap for cross darwin-x64.
+  local args="override_electron_version=\"${ELECTRON_VERSION}\" symbol_level=0 blink_symbol_level=0 v8_symbol_level=0 chrome_pgo_phase=0"
   if [ -n "${GN_CC_WRAPPER:-}" ]; then
     args="$args cc_wrapper=\"${GN_CC_WRAPPER}\""
   fi
@@ -53,6 +52,18 @@ checkpoint_interval_for_pass() {
     interval="$MAX_CHECKPOINT_SECONDS"
   fi
   printf '%s' "$interval"
+}
+
+# Left unset, ninja picks its own parallelism (cores + 2). NINJA_J overrides that,
+# which is how the 32-vCPU Windows box gets oversubscribed. macOS bash is 3.2, where
+# expanding an empty array under `set -u` is an error, so branch on the variable
+# instead of building an args array.
+run_build() {
+  if [ -n "${NINJA_J:-}" ]; then
+    CI=1 GN_EXTRA_ARGS="$(gn_extra_args)" e build --no-remote -j "$NINJA_J" 2>&1
+  else
+    CI=1 GN_EXTRA_ARGS="$(gn_extra_args)" e build --no-remote 2>&1
+  fi
 }
 
 # Every edge ninja has ever completed in this build dir, across passes and runs.
@@ -74,7 +85,7 @@ run_pass() {
   # Job control gives the pass its own process group, so the signal below
   # reaches ninja and its compiler children rather than just the `e` wrapper.
   set -m
-  { CI=1 GN_EXTRA_ARGS="$(gn_extra_args)" e build --no-remote 2>&1; echo $? > "$rc_file"; } \
+  { run_build; echo $? > "$rc_file"; } \
     | python3 "$SCRIPT_DIR/throttle-build-output.py" "$PROGRESS_INTERVAL_SECONDS" &
   pid=$!
   set +m
@@ -116,6 +127,20 @@ run_pass() {
   rm -f "$rc_file"
   return "${build_rc:-1}"
 }
+
+# Build duration is dominated by how many cores this box actually has, so record the
+# parallelism in the log — otherwise a slow build is indistinguishable from a
+# misconfigured one.
+if command -v nproc >/dev/null 2>&1; then
+  cores="$(nproc)"
+else
+  cores="$(sysctl -n hw.ncpu 2>/dev/null || echo unknown)"
+fi
+if [ -n "${NINJA_J:-}" ]; then
+  echo "ninja parallelism: -j ${NINJA_J} (host reports ${cores} cores)"
+else
+  echo "ninja parallelism: ninja default, normally cores+2 (host reports ${cores} cores)"
+fi
 
 "$SCRIPT_DIR/out-cache.sh" restore
 

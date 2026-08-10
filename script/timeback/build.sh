@@ -10,7 +10,12 @@ set -euo pipefail
 : "${ELECTRON_VERSION:?ELECTRON_VERSION is required}"
 
 gn_extra_args() {
-  local args="override_electron_version=\"${ELECTRON_VERSION}\""
+  # override_electron_version stamps our npm/release version.
+  # symbol_level=0 + chrome_pgo_phase=0 shave substantial compile/link time so
+  # macOS larger-runner jobs can fit under GitHub's hard 6h cap (cross x64 was
+  # ~2h short at 59k/79k). Crash-fix semantics are unchanged; re-enable PGO
+  # later if we need official-perf parity.
+  local args="override_electron_version=\"${ELECTRON_VERSION}\" symbol_level=0 blink_symbol_level=0 v8_symbol_level=0 chrome_pgo_phase=0"
   if [ -n "${GN_CC_WRAPPER:-}" ]; then
     args="$args cc_wrapper=\"${GN_CC_WRAPPER}\""
   fi
