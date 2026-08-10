@@ -176,8 +176,9 @@ jobs:
           echo "HOST_ARCH_KEY=$HOST_ARCH_KEY" >> "$GITHUB_ENV"
           echo "CACHE_KEY=src-cache/${TARGET_PLATFORM}-${HOST_ARCH_KEY}/${DEPSHASH}.tar.zst" >> "$GITHUB_ENV"
           echo "LEGACY_CACHE_KEY=src-cache/${TARGET_PLATFORM}/${DEPSHASH}.tar.zst" >> "$GITHUB_ENV"
-          # Out-cache is per host+target so arm64 native and x64 cross never clash.
-          echo "OUT_CACHE_PREFIX=out-cache/${TARGET_PLATFORM}-${HOST_ARCH_KEY}-target-${TARGET_ARCH}/${DEPSHASH}/" >> "$GITHUB_ENV"
+          # Out-cache is per host+target+build-flavor so GN arg changes (e.g.
+          # symbol_level) never resume from an incompatible object tree.
+          echo "OUT_CACHE_PREFIX=out-cache/${TARGET_PLATFORM}-${HOST_ARCH_KEY}-target-${TARGET_ARCH}/syms-default-nopgo/${DEPSHASH}/" >> "$GITHUB_ENV"
           echo "Cache key: src-cache/${TARGET_PLATFORM}-${HOST_ARCH_KEY}/${DEPSHASH}.tar.zst (target=${TARGET_ARCH})"
 
       - name: Configure AWS credentials from OIDC
