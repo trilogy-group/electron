@@ -37,7 +37,17 @@ chmod +x "$BIN" 2>/dev/null || true
 echo "=== smoke: binary $BIN ==="
 
 echo "=== smoke: --version ==="
-VERSION_OUT="$("$BIN" --version)"
+# x64 Electron on Apple Silicon needs Rosetta (arch -x86_64).
+RUN_BIN=("$BIN")
+if [ "$PLATFORM" = "macos" ]; then
+  BIN_ARCH="$(file -b "$BIN" 2>/dev/null || true)"
+  HOST_ARCH="$(uname -m)"
+  if [[ "$BIN_ARCH" == *"x86_64"* ]] && [ "$HOST_ARCH" = "arm64" ]; then
+    RUN_BIN=(arch -x86_64 "$BIN")
+    echo "=== smoke: using Rosetta (arch -x86_64) for x64 binary on arm64 host ==="
+  fi
+fi
+VERSION_OUT="$("${RUN_BIN[@]}" --version)"
 echo "$VERSION_OUT"
 case "$VERSION_OUT" in
   *"$EXPECTED_VERSION"*) : ;;
@@ -51,6 +61,6 @@ printf '{"name":"tb-smoke","version":"1.0.0","main":"main.js"}\n' > "$SMOKE_APP/
 cp "$(dirname "$0")/smoke-test-binary.js" "$SMOKE_APP/main.js"
 
 SMOKE_EXPECTED_VERSION="$EXPECTED_VERSION" \
-  "$BIN" "$SMOKE_APP" --no-sandbox
+  "${RUN_BIN[@]}" "$SMOKE_APP" --no-sandbox
 
 echo "=== smoke: OK ==="
