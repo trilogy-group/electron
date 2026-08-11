@@ -142,19 +142,47 @@ else
   echo "ninja parallelism: ninja default, normally cores+2 (host reports ${cores} cores)"
 fi
 
+# src-cache tar extract sets every source mtime to "now". That alone makes
+# ninja dirty the whole graph vs restored objects, and build.ninja.d forces gn
+# to regenerate on startup — undoing any *.o touch. Clamp before out restore
+# work / gn gen. (Workflow should also clamp; this is the hard guarantee.)
+if [ -d src ]; then
+  bash "$SCRIPT_DIR/clamp-src-mtimes.sh" src
+fi
+
 "$SCRIPT_DIR/out-cache.sh" restore
 
-# Resume order matters:
-#   1) restore objects (S3 mtimes are older than src-cache extract "now")
-#   2) gn gen (rewrites build.ninja / xcode_links / some gen/ headers)
-#   3) touch *.o/*.a only AFTER gen — otherwise freshly rewritten gen/ inputs
-#      are newer than every object and ninja schedules a full ~80k rebuild
-#      despite a 76G restore (seen as [~600/77655] after HIT).
+# After a warm out-cache restore: recreate xcode_links (not mirrored), keep the
+# restored build.ninja/toolchain.ninja so .ninja_log command hashes still match,
+# then refuse to burn a 6h runner if dry-run still looks like a full rebuild.
+readonly RESUME_DRY_RUN_MAX="${RESUME_DRY_RUN_MAX:-35000}"
 if [ -d "${OUT_DIR:-src/out/Release}" ] && [ "${USE_OUT_CACHE:-true}" = "true" ]; then
   if [ -n "$(find "${OUT_DIR:-src/out/Release}" -type f -name '*.o' -print -quit 2>/dev/null)" ]; then
-    echo "=== resume prep: gn gen only, then touch compile outputs ==="
-    CI=1 GN_EXTRA_ARGS="$(gn_extra_args)" e build --no-remote --gen only
+    echo "=== resume prep: ensure xcode_links, touch outputs, ninja dry-run gate ==="
+    if [ ! -e "${OUT_DIR:-src/out/Release}/xcode_links" ]; then
+      CI=1 GN_EXTRA_ARGS="$(gn_extra_args)" e build --no-remote --gen only
+      # gn may rewrite a few generated files; sources stay clamped, freshen objs.
+      bash "$SCRIPT_DIR/clamp-src-mtimes.sh" src
+    fi
     "$SCRIPT_DIR/out-cache.sh" touch-outputs
+
+    dry_file="$(mktemp)"
+    if ! ninja -C "${OUT_DIR:-src/out/Release}" -n electron >"$dry_file" 2>&1; then
+      echo "ninja dry-run failed; dumping output"
+      cat "$dry_file" || true
+      rm -f "$dry_file"
+      exit 1
+    fi
+    dry_lines="$(wc -l < "$dry_file" | tr -d ' ')"
+    echo "ninja -n electron: $dry_lines planned steps (gate max ${RESUME_DRY_RUN_MAX})"
+    tail -n 20 "$dry_file" || true
+    if [ "$dry_lines" -gt "$RESUME_DRY_RUN_MAX" ]; then
+      echo "::error::out-cache resume looks broken (${dry_lines} dry-run steps > ${RESUME_DRY_RUN_MAX}). Refusing to burn the runner. First explains:"
+      ninja -C "${OUT_DIR:-src/out/Release}" -d explain electron 2>&1 | head -n 80 || true
+      rm -f "$dry_file"
+      exit 1
+    fi
+    rm -f "$dry_file"
   fi
 fi
 

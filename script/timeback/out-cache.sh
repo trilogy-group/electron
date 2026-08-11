@@ -13,6 +13,9 @@
 #
 # Env: CACHE_BUCKET, OUT_CACHE_PREFIX, OUT_DIR (default src/out/Release),
 #      USE_OUT_CACHE (anything but "true" makes this a no-op).
+#
+# Resume requires clamp-src-mtimes.sh on the source tree BEFORE ninja: tar
+# extract mtimes otherwise force a full rebuild even with a warm out-cache.
 set -uo pipefail
 
 readonly SANITY_FILE=build.ninja
@@ -46,9 +49,8 @@ aws configure set default.s3.max_concurrent_requests "$S3_CONCURRENCY" || true
 export AWS_REQUEST_CHECKSUM_CALCULATION="${AWS_REQUEST_CHECKSUM_CALCULATION:-when_required}"
 export AWS_RESPONSE_CHECKSUM_VALIDATION="${AWS_RESPONSE_CHECKSUM_VALIDATION:-when_required}"
 
-# Freshen compile products only. Touching gen/ or the whole tree is harmful:
-# `gn gen` rewrites generated headers afterward, and those newer inputs then
-# invalidate every .o again (looks like a cache miss despite a 76G restore).
+# Optional safety freshen of compile products (after src mtimes are clamped and
+# xcode_links recreated). Prefer clamping sources; this is belt-and-suspenders.
 touch_compile_outputs() {
   if [ ! -d "$OUT_DIR" ]; then
     return 0
@@ -58,7 +60,7 @@ touch_compile_outputs() {
       -name '*.o' -o -name '*.obj' -o -name '*.a' -o -name '*.dylib' \
       -o -name '*.so' -o -name '*.bundle' -o -name '*.pch' -o -name '*.gch' \
     \) | wc -l | tr -d ' ')"
-  echo "touching ${count} compile outputs under $OUT_DIR (post-gn incremental resume)"
+  echo "touching ${count} compile outputs under $OUT_DIR"
   find "$OUT_DIR" -type f \( \
       -name '*.o' -o -name '*.obj' -o -name '*.a' -o -name '*.dylib' \
       -o -name '*.so' -o -name '*.bundle' -o -name '*.pch' -o -name '*.gch' \
@@ -67,9 +69,9 @@ touch_compile_outputs() {
 
 restore() {
   # Marker (or intact build.ninja) means a prior restore/sync already populated
-  # this workspace. Do not re-sync; the caller runs gn gen then touch-outputs.
+  # this workspace. Do not re-sync.
   if [ -f "$OUT_DIR/.timeback-out-restored" ] || [ -f "$OUT_DIR/$SANITY_FILE" ]; then
-    echo "out dir already present locally; skipping re-sync (caller must touch after gn gen)"
+    echo "out dir already present locally; skipping re-sync"
     return 0
   fi
   if ! aws s3 ls "${S3_URI}/${SANITY_FILE}" >/dev/null 2>&1; then
@@ -87,12 +89,13 @@ restore() {
     echo "restored $OUT_DIR ($size, ${obj_count} object files)"
     touch "$OUT_DIR/.timeback-out-restored"
 
-    # xcode_links is excluded from the mirror, so a checkpoint can leave
-    # build.ninja referencing SDK paths gn must regenerate locally. Drop the
-    # ninja files so the next build pass reruns gn; objects stay so compile
-    # remains incremental AFTER the caller touches them post-gn.
-    rm -f "$OUT_DIR/build.ninja" "$OUT_DIR/build.ninja.stamp" "$OUT_DIR/toolchain.ninja"
-    echo "invalidated ninja files for xcode_links regen (objects retained; touch after gn gen)"
+    # Keep build.ninja / toolchain.ninja. Deleting them forced a full gn rewrite
+    # and threw away command-line identity in .ninja_log. xcode_links is excluded
+    # from the mirror; the caller recreates it with gn gen (commands stay the
+    # same: -isysroot xcode_links/electron/MacOSX*.sdk is relative).
+    if [ ! -e "$OUT_DIR/xcode_links" ]; then
+      echo "xcode_links absent after restore (expected); recreate with gn gen before ninja"
+    fi
     return 0
   fi
 

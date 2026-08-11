@@ -301,6 +301,12 @@ jobs:
       - name: Add CHROMIUM_BUILDTOOLS_PATH to env
         run: echo "CHROMIUM_BUILDTOOLS_PATH=$(pwd)/src/buildtools" >> "$GITHUB_ENV"
 
+      # Tar extract + hooks leave every source at mtime=now; clamp so a restored
+      # out-cache resumes instead of scheduling ~77k CXX edges again.
+      - name: Clamp src mtimes for out-cache resume
+        if: ${{ inputs.use_out_cache }}
+        run: bash src/electron/script/timeback/clamp-src-mtimes.sh src
+
       - name: Restore out cache
         if: ${{ inputs.use_out_cache }}
         run: bash src/electron/script/timeback/out-cache.sh restore
