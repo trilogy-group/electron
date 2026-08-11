@@ -156,13 +156,19 @@ fi
 
 "$SCRIPT_DIR/out-cache.sh" restore
 
-readonly RESUME_DRY_RUN_MAX="${RESUME_DRY_RUN_MAX:-35000}"
+readonly RESUME_DRY_RUN_MAX="${RESUME_DRY_RUN_MAX:-50000}"
 readonly OUT="${OUT_DIR:-src/out/Release}"
 if [ -d "$OUT" ] && [ "${USE_OUT_CACHE:-true}" = "true" ]; then
   if [ -n "$(find "$OUT" -type f -name '*.o' -print -quit 2>/dev/null)" ]; then
-    echo "=== resume prep: xcode_links, deps mtimes, dry-run gate ==="
+    echo "=== resume prep: xcode_links, scrub wrong-SDK objs, deps mtimes, dry-run gate ==="
 
     bash "$SCRIPT_DIR/ensure-xcode-links.sh" "$OUT"
+
+    # MacOSX26.4.sdk → 26.4 for scrubbing ThinLTO SDK mismatches.
+    SDK_VER="$(sed -n 's/.*xcode_links\/electron\/MacOSX\([0-9][0-9]*\.[0-9][0-9]*\)\.sdk.*/\1/p' \
+      "${OUT}/args.gn" 2>/dev/null | head -1 || true)"
+    SDK_VER="${SDK_VER:-26.4}"
+    bash "$SCRIPT_DIR/scrub-wrong-sdk-objects.sh" "$OUT" "$SDK_VER"
 
     # Generated headers under out/ also arrive with S3 LastModified; pin them
     # older than restored object mtimes so they do not dirty the graph.
