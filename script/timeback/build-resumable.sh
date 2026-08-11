@@ -144,12 +144,17 @@ fi
 
 "$SCRIPT_DIR/out-cache.sh" restore
 
-# After restore + impending gn gen, re-touch outputs once more so anything gn
-# rewrites as inputs does not leave .o files looking stale relative to src.
+# Resume order matters:
+#   1) restore objects (S3 mtimes are older than src-cache extract "now")
+#   2) gn gen (rewrites build.ninja / xcode_links / some gen/ headers)
+#   3) touch *.o/*.a only AFTER gen — otherwise freshly rewritten gen/ inputs
+#      are newer than every object and ninja schedules a full ~80k rebuild
+#      despite a 76G restore (seen as [~600/77655] after HIT).
 if [ -d "${OUT_DIR:-src/out/Release}" ] && [ "${USE_OUT_CACHE:-true}" = "true" ]; then
   if [ -n "$(find "${OUT_DIR:-src/out/Release}" -type f -name '*.o' -print -quit 2>/dev/null)" ]; then
-    echo "re-touching out dir before first pass (incremental resume guard)"
-    find "${OUT_DIR:-src/out/Release}" -type f -exec touch {} +
+    echo "=== resume prep: gn gen only, then touch compile outputs ==="
+    CI=1 GN_EXTRA_ARGS="$(gn_extra_args)" e build --no-remote --gen only
+    "$SCRIPT_DIR/out-cache.sh" touch-outputs
   fi
 fi
 

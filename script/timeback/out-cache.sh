@@ -9,7 +9,7 @@
 # mid-build checkpoint uploads only the objects that were compiled since the
 # previous one instead of tens of GB every time.
 #
-# Usage: out-cache.sh restore | save
+# Usage: out-cache.sh restore | save | touch-outputs
 #
 # Env: CACHE_BUCKET, OUT_CACHE_PREFIX, OUT_DIR (default src/out/Release),
 #      USE_OUT_CACHE (anything but "true" makes this a no-op).
@@ -46,12 +46,30 @@ aws configure set default.s3.max_concurrent_requests "$S3_CONCURRENCY" || true
 export AWS_REQUEST_CHECKSUM_CALCULATION="${AWS_REQUEST_CHECKSUM_CALCULATION:-when_required}"
 export AWS_RESPONSE_CHECKSUM_VALIDATION="${AWS_RESPONSE_CHECKSUM_VALIDATION:-when_required}"
 
+# Freshen compile products only. Touching gen/ or the whole tree is harmful:
+# `gn gen` rewrites generated headers afterward, and those newer inputs then
+# invalidate every .o again (looks like a cache miss despite a 76G restore).
+touch_compile_outputs() {
+  if [ ! -d "$OUT_DIR" ]; then
+    return 0
+  fi
+  local count
+  count="$(find "$OUT_DIR" -type f \( \
+      -name '*.o' -o -name '*.obj' -o -name '*.a' -o -name '*.dylib' \
+      -o -name '*.so' -o -name '*.bundle' -o -name '*.pch' -o -name '*.gch' \
+    \) | wc -l | tr -d ' ')"
+  echo "touching ${count} compile outputs under $OUT_DIR (post-gn incremental resume)"
+  find "$OUT_DIR" -type f \( \
+      -name '*.o' -o -name '*.obj' -o -name '*.a' -o -name '*.dylib' \
+      -o -name '*.so' -o -name '*.bundle' -o -name '*.pch' -o -name '*.gch' \
+    \) -exec touch {} + 2>/dev/null || true
+}
+
 restore() {
   # Marker (or intact build.ninja) means a prior restore/sync already populated
-  # this workspace. Re-touch so any later src-cache extract cannot win on mtime.
+  # this workspace. Do not re-sync; the caller runs gn gen then touch-outputs.
   if [ -f "$OUT_DIR/.timeback-out-restored" ] || [ -f "$OUT_DIR/$SANITY_FILE" ]; then
-    echo "out dir already present locally; re-touching outputs for incremental resume"
-    find "$OUT_DIR" -type f -exec touch {} + 2>/dev/null || true
+    echo "out dir already present locally; skipping re-sync (caller must touch after gn gen)"
     return 0
   fi
   if ! aws s3 ls "${S3_URI}/${SANITY_FILE}" >/dev/null 2>&1; then
@@ -67,22 +85,14 @@ restore() {
     obj_count="$(find "$OUT_DIR" -type f \( -name '*.o' -o -name '*.obj' \) | wc -l | tr -d ' ')"
     size="$(du -sh "$OUT_DIR" | cut -f1)"
     echo "restored $OUT_DIR ($size, ${obj_count} object files)"
-
-    # CRITICAL: src-cache tarball extract sets source mtimes to "now". S3 sync
-    # preserves older compile mtimes on .o/.a outputs. Ninja then sees every
-    # header/source as newer than every object and rebuilds the entire ~80k
-    # graph — looking like a cache miss even when the objects are present.
-    # Bump all restored outputs to now so they are newer than the extracted src.
-    echo "touching restored outputs so src-cache mtimes do not invalidate the tree"
-    find "$OUT_DIR" -type f -exec touch {} +
     touch "$OUT_DIR/.timeback-out-restored"
 
     # xcode_links is excluded from the mirror, so a checkpoint can leave
     # build.ninja referencing SDK paths gn must regenerate locally. Drop the
-    # ninja files so the next build pass reruns gn; objects stay (and are now
-    # mtime-fresh) so compile remains incremental after gn gen.
+    # ninja files so the next build pass reruns gn; objects stay so compile
+    # remains incremental AFTER the caller touches them post-gn.
     rm -f "$OUT_DIR/build.ninja" "$OUT_DIR/build.ninja.stamp" "$OUT_DIR/toolchain.ninja"
-    echo "invalidated ninja files for xcode_links regen (objects retained)"
+    echo "invalidated ninja files for xcode_links regen (objects retained; touch after gn gen)"
     return 0
   fi
 
@@ -126,8 +136,9 @@ save() {
 case "${1:-}" in
   restore) restore ;;
   save) save ;;
+  touch-outputs) touch_compile_outputs ;;
   *)
-    echo "usage: $(basename "$0") restore|save" >&2
+    echo "usage: $(basename "$0") restore|save|touch-outputs" >&2
     exit 2
     ;;
 esac
