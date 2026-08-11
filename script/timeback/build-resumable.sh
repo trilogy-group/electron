@@ -144,12 +144,21 @@ fi
 
 "$SCRIPT_DIR/out-cache.sh" restore
 
+# After restore + impending gn gen, re-touch outputs once more so anything gn
+# rewrites as inputs does not leave .o files looking stale relative to src.
+if [ -d "${OUT_DIR:-src/out/Release}" ] && [ "${USE_OUT_CACHE:-true}" = "true" ]; then
+  if [ -n "$(find "${OUT_DIR:-src/out/Release}" -type f -name '*.o' -print -quit 2>/dev/null)" ]; then
+    echo "re-touching out dir before first pass (incremental resume guard)"
+    find "${OUT_DIR:-src/out/Release}" -type f -exec touch {} +
+  fi
+fi
+
 rc=0
 for pass in $(seq 1 "$MAX_PASSES"); do
   budget=$(checkpoint_interval_for_pass "$pass")
   # Deliberately not a ::group::; collapsed groups stop streaming in the UI, which
   # made a healthy multi-hour compile look frozen.
-  echo "=== build pass ${pass}/${MAX_PASSES}: $(edges_completed) edges done, checkpoint after ${budget}s ==="
+  echo "=== build pass ${pass}/${MAX_PASSES}: $(edges_completed) edges recorded in .ninja_log, checkpoint after ${budget}s ==="
   run_pass "$budget"
   rc=$?
 
