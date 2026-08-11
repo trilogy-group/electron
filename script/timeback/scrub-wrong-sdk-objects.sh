@@ -24,28 +24,26 @@ find "$OUT_DIR" -type d -name 'thinlto-cache' -prune -print 2>/dev/null \
       rm -rf "$d"
     done
 
-# Host toolchains are cheap to rebuild relative to the target chrome/electron
-# graph. The SDK conflict that stopped us was in clang_arm64_v8_x64 (host).
-# Wipe host *outputs* but keep *.ninja — build.ninja includes
-# clang_arm64/toolchain.ninja; deleting the whole tree breaks the graph.
+# Host toolchains: delete *.o / *.a only. Keep *.ninja, *.rsp, gen/, stamps —
+# wiping those breaks ninja's "rebuild build.ninja" path (missing .rsp inputs).
 host_scrubbed=0
-host_files_deleted=0
+host_objs_deleted=0
 for host in clang_arm64 clang_arm64_v8_x64 clang_arm64_for_rust_host_build_tools \
             clang_arm64_host_with_system_allocator clang_x64_with_system_allocator; do
   host_dir="${OUT_DIR}/${host}"
   if [ -d "$host_dir" ]; then
-    echo "scrubbing host outs (keeping *.ninja): ${host}"
+    echo "scrubbing host objects (*.o/*.a only): ${host}"
     while IFS= read -r -d '' f; do
       rm -f "$f"
-      host_files_deleted=$((host_files_deleted + 1))
-    done < <(find "$host_dir" -type f ! -name '*.ninja' -print0 2>/dev/null)
+      host_objs_deleted=$((host_objs_deleted + 1))
+    done < <(find "$host_dir" -type f \( -name '*.o' -o -name '*.a' \) -print0 2>/dev/null)
     host_scrubbed=$((host_scrubbed + 1))
   fi
 done
-echo "scrub-wrong-sdk-objects: scrubbed ${host_scrubbed} host trees (${host_files_deleted} non-ninja files)"
+echo "scrub-wrong-sdk-objects: scrubbed ${host_scrubbed} host trees (${host_objs_deleted} .o/.a)"
 
-# Remaining (target) objects: drop any Mach-O that reports a different sdk
-# in LC_BUILD_VERSION.
+# Target (and any remaining) objects: drop Mach-O with a different sdk in
+# LC_BUILD_VERSION (objects compiled under the live 26.5 SDKROOT).
 deleted=0
 checked=0
 while IFS= read -r -d '' f; do
@@ -57,4 +55,4 @@ while IFS= read -r -d '' f; do
   fi
 done < <(find "$OUT_DIR" -type f -name '*.o' -print0 2>/dev/null)
 
-echo "scrub-wrong-sdk-objects: target checked=${checked} deleted=${deleted} (want ${WANT_VER})"
+echo "scrub-wrong-sdk-objects: remaining checked=${checked} deleted=${deleted} (want ${WANT_VER})"
