@@ -47,8 +47,11 @@ export AWS_REQUEST_CHECKSUM_CALCULATION="${AWS_REQUEST_CHECKSUM_CALCULATION:-whe
 export AWS_RESPONSE_CHECKSUM_VALIDATION="${AWS_RESPONSE_CHECKSUM_VALIDATION:-when_required}"
 
 restore() {
-  if [ -f "$OUT_DIR/$SANITY_FILE" ]; then
-    echo "out dir already present locally; keeping it"
+  # Marker (or intact build.ninja) means a prior restore/sync already populated
+  # this workspace. Re-touch so any later src-cache extract cannot win on mtime.
+  if [ -f "$OUT_DIR/.timeback-out-restored" ] || [ -f "$OUT_DIR/$SANITY_FILE" ]; then
+    echo "out dir already present locally; re-touching outputs for incremental resume"
+    find "$OUT_DIR" -type f -exec touch {} + 2>/dev/null || true
     return 0
   fi
   if ! aws s3 ls "${S3_URI}/${SANITY_FILE}" >/dev/null 2>&1; then
@@ -60,12 +63,26 @@ restore() {
   mkdir -p "$OUT_DIR"
   if aws s3 sync "$S3_URI" "$OUT_DIR" "${SYNC_FLAGS[@]}" "${CACHE_EXCLUDES[@]}" \
      && [ -f "$OUT_DIR/$SANITY_FILE" ]; then
-    # xcode_links is excluded from the mirror, so a checkpoint saved before that
-    # exclude (or on another runner) can leave build.ninja referencing SDK paths
-    # gn must regenerate locally. Drop the ninja stamp files so the next build
-    # pass reruns gn instead of dying on missing Mach .defs.
+    local obj_count size
+    obj_count="$(find "$OUT_DIR" -type f \( -name '*.o' -o -name '*.obj' \) | wc -l | tr -d ' ')"
+    size="$(du -sh "$OUT_DIR" | cut -f1)"
+    echo "restored $OUT_DIR ($size, ${obj_count} object files)"
+
+    # CRITICAL: src-cache tarball extract sets source mtimes to "now". S3 sync
+    # preserves older compile mtimes on .o/.a outputs. Ninja then sees every
+    # header/source as newer than every object and rebuilds the entire ~80k
+    # graph — looking like a cache miss even when the objects are present.
+    # Bump all restored outputs to now so they are newer than the extracted src.
+    echo "touching restored outputs so src-cache mtimes do not invalidate the tree"
+    find "$OUT_DIR" -type f -exec touch {} +
+    touch "$OUT_DIR/.timeback-out-restored"
+
+    # xcode_links is excluded from the mirror, so a checkpoint can leave
+    # build.ninja referencing SDK paths gn must regenerate locally. Drop the
+    # ninja files so the next build pass reruns gn; objects stay (and are now
+    # mtime-fresh) so compile remains incremental after gn gen.
     rm -f "$OUT_DIR/build.ninja" "$OUT_DIR/build.ninja.stamp" "$OUT_DIR/toolchain.ninja"
-    echo "restored $OUT_DIR ($(du -sh "$OUT_DIR" | cut -f1)); invalidated ninja files for xcode_links regen"
+    echo "invalidated ninja files for xcode_links regen (objects retained)"
     return 0
   fi
 
