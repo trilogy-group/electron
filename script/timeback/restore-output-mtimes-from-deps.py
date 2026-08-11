@@ -40,8 +40,8 @@ def load_deps_log(path: str) -> dict[str, int]:
         raise SystemExit(f"unsupported deps log version {version} (want {VERSION})")
 
     paths: list[str | None] = []
-    # out_id -> (mtime_ns, list of input ids) ; last record wins
-    deps: dict[int, tuple[int, list[int]]] = {}
+    # out_id -> mtime_ns ; last record wins
+    deps: dict[int, int] = {}
 
     while offset + 4 <= len(data):
         (size_field,) = struct.unpack_from("<I", data, offset)
@@ -59,34 +59,24 @@ def load_deps_log(path: str) -> dict[str, int]:
             words = list(struct.unpack(f"<{size // 4}i", payload))
             out_id = words[0]
             mtime = ((words[2] & 0xFFFFFFFF) << 32) | (words[1] & 0xFFFFFFFF)
-      input_ids = words[3:]
+            input_ids = words[3:]
             if out_id < 0 or out_id >= len(paths) or paths[out_id] is None:
                 continue
             if any(i < 0 or i >= len(paths) or paths[i] is None for i in input_ids):
                 continue
-            deps[out_id] = (mtime, input_ids)
+            deps[out_id] = mtime
         else:
             if size < 4:
                 break
-            path_size = size - 4
-            raw = payload[:path_size]
-            while raw and raw[-1] == 0:
-                raw = raw[:-1]
-            # checksum is last 4 bytes of payload; path is before padding
-            # payload layout: path + padding + checksum(4)
+            # payload: path + padding + checksum(4)
             path_bytes = payload[:-4]
             while path_bytes and path_bytes[-1] == 0:
                 path_bytes = path_bytes[:-1]
             rel = path_bytes.decode("utf-8", errors="surrogateescape")
-            expected_id = len(paths)
-            (checksum,) = struct.unpack_from("<I", payload, size - 4)
-            if checksum != (~expected_id & 0xFFFFFFFF):
-                # concurrent-write detection; still accept in order
-                pass
             paths.append(rel)
 
     out: dict[str, int] = {}
-    for out_id, (mtime, _) in deps.items():
+    for out_id, mtime in deps.items():
         p = paths[out_id]
         if p:
             out[p] = mtime
@@ -119,6 +109,13 @@ def main() -> int:
         f"restored mtimes on {updated} outputs from .ninja_deps "
         f"({missing} missing, {len(entries)} deps entries)"
     )
+    if entries and updated == 0:
+        print(
+            "ERROR: deps log has entries but no output mtimes were restored "
+            "(wrong out_dir or empty tree?)",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

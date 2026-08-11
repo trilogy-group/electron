@@ -144,10 +144,12 @@ fi
 
 # Resume after an S3 out-cache restore:
 #   1) Clamp sources older than restored objects (tar extract mtimes = now).
-#   2) Restore each output's mtime from .ninja_deps (s3 sync / touch make
-#      objects newer than the deps log → ninja invalidates every edge).
-#   3) Recreate xcode_links if needed; never touch *.o afterward.
-#   4) Fail fast if ninja -n still looks like a full rebuild.
+#   2) Recreate xcode_links (symlink only — do not gn gen; that fights the
+#      restored build.ninja and was failing on missing SDK defs).
+#   3) Restore each output's mtime from .ninja_deps (s3 sync makes objects
+#      newer than the deps log → ninja invalidates every edge).
+#   4) Never touch *.o afterward.
+#   5) Fail fast if ninja -n still looks like a full rebuild.
 if [ -d src ]; then
   bash "$SCRIPT_DIR/clamp-src-mtimes.sh" src
 fi
@@ -158,7 +160,9 @@ readonly RESUME_DRY_RUN_MAX="${RESUME_DRY_RUN_MAX:-35000}"
 readonly OUT="${OUT_DIR:-src/out/Release}"
 if [ -d "$OUT" ] && [ "${USE_OUT_CACHE:-true}" = "true" ]; then
   if [ -n "$(find "$OUT" -type f -name '*.o' -print -quit 2>/dev/null)" ]; then
-    echo "=== resume prep: deps mtimes, xcode_links, dry-run gate ==="
+    echo "=== resume prep: xcode_links, deps mtimes, dry-run gate ==="
+
+    bash "$SCRIPT_DIR/ensure-xcode-links.sh" "$OUT"
 
     # Generated headers under out/ also arrive with S3 LastModified; pin them
     # older than restored object mtimes so they do not dirty the graph.
@@ -168,16 +172,6 @@ if [ -d "$OUT" ] && [ "${USE_OUT_CACHE:-true}" = "true" ]; then
     fi
 
     python3 "$SCRIPT_DIR/restore-output-mtimes-from-deps.py" "$OUT"
-
-    if [ ! -e "$OUT/xcode_links" ]; then
-      CI=1 GN_EXTRA_ARGS="$(gn_extra_args)" e build --no-remote --gen only
-      bash "$SCRIPT_DIR/clamp-src-mtimes.sh" src
-      if [ -d "$OUT/gen" ]; then
-        find "$OUT/gen" -type f -print0 | xargs -0 touch -t "${SRC_MTIME_STAMP:-202001010000}"
-      fi
-      # gn must not leave objects newer than the deps log.
-      python3 "$SCRIPT_DIR/restore-output-mtimes-from-deps.py" "$OUT"
-    fi
 
     dry_file="$(mktemp)"
     if ! ninja -C "$OUT" -n electron >"$dry_file" 2>&1; then
