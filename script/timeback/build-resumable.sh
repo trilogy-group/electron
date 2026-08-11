@@ -156,7 +156,9 @@ fi
 
 "$SCRIPT_DIR/out-cache.sh" restore
 
-readonly RESUME_DRY_RUN_MAX="${RESUME_DRY_RUN_MAX:-50000}"
+# Host-toolchain scrub after an SDK mismatch adds several thousand rebuild
+# edges on top of a healthy ~33k resume; keep headroom under the 6h cap.
+readonly RESUME_DRY_RUN_MAX="${RESUME_DRY_RUN_MAX:-70000}"
 readonly OUT="${OUT_DIR:-src/out/Release}"
 if [ -d "$OUT" ] && [ "${USE_OUT_CACHE:-true}" = "true" ]; then
   if [ -n "$(find "$OUT" -type f -name '*.o' -print -quit 2>/dev/null)" ]; then

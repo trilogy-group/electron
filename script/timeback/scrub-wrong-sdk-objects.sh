@@ -26,19 +26,26 @@ find "$OUT_DIR" -type d -name 'thinlto-cache' -prune -print 2>/dev/null \
 
 # Host toolchains are cheap to rebuild relative to the target chrome/electron
 # graph. The SDK conflict that stopped us was in clang_arm64_v8_x64 (host).
-# Wiping host outs forces a clean recompile against the hermetic 26.4 SDK.
-host_deleted=0
+# Wipe host *outputs* but keep *.ninja — build.ninja includes
+# clang_arm64/toolchain.ninja; deleting the whole tree breaks the graph.
+host_scrubbed=0
+host_files_deleted=0
 for host in clang_arm64 clang_arm64_v8_x64 clang_arm64_for_rust_host_build_tools \
             clang_arm64_host_with_system_allocator clang_x64_with_system_allocator; do
-  if [ -d "${OUT_DIR}/${host}" ]; then
-    echo "removing host toolchain outs: ${host}"
-    rm -rf "${OUT_DIR}/${host}"
-    host_deleted=$((host_deleted + 1))
+  host_dir="${OUT_DIR}/${host}"
+  if [ -d "$host_dir" ]; then
+    echo "scrubbing host outs (keeping *.ninja): ${host}"
+    while IFS= read -r -d '' f; do
+      rm -f "$f"
+      host_files_deleted=$((host_files_deleted + 1))
+    done < <(find "$host_dir" -type f ! -name '*.ninja' -print0 2>/dev/null)
+    host_scrubbed=$((host_scrubbed + 1))
   fi
 done
-echo "scrub-wrong-sdk-objects: removed ${host_deleted} host toolchain trees"
+echo "scrub-wrong-sdk-objects: scrubbed ${host_scrubbed} host trees (${host_files_deleted} non-ninja files)"
 
-# Target objects: drop any Mach-O that reports a different sdk in LC_BUILD_VERSION.
+# Remaining (target) objects: drop any Mach-O that reports a different sdk
+# in LC_BUILD_VERSION.
 deleted=0
 checked=0
 while IFS= read -r -d '' f; do
