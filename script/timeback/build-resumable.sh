@@ -156,8 +156,8 @@ fi
 
 "$SCRIPT_DIR/out-cache.sh" restore
 
-# Host-toolchain scrub after an SDK mismatch adds several thousand rebuild
-# edges on top of a healthy ~33k resume; keep headroom under the 6h cap.
+# Otool-only scrub after an SDK mismatch; never bulk-wipe host *.o (that
+# re-planned ~43k steps every 6h resume).
 readonly RESUME_DRY_RUN_MAX="${RESUME_DRY_RUN_MAX:-70000}"
 readonly OUT="${OUT_DIR:-src/out/Release}"
 if [ -d "$OUT" ] && [ "${USE_OUT_CACHE:-true}" = "true" ]; then
