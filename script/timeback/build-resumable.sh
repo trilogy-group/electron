@@ -79,6 +79,8 @@ edges_completed() {
 # Runs one pass, returning PAUSED_RC if the time budget expired first.
 run_pass() {
   local budget="$1" pid deadline rc_file build_rc
+  local edges_at_start
+  edges_at_start="$(edges_completed)"
   # The throttler is the tail of a pipeline, so the build's own status has to
   # travel out of band.
   rc_file="$(mktemp)"
@@ -100,6 +102,17 @@ run_pass() {
       next_heartbeat=$(( SECONDS + HEARTBEAT_SECONDS ))
     fi
     if (( SECONDS >= deadline )); then
+      local edges_now
+      edges_now="$(edges_completed)"
+      # ThinLTO / dsymutil can run 20–40+ minutes as a single edge. Killing that
+      # for a checkpoint restarts the link from zero every budget window (seen:
+      # .ninja_log stuck at the same count across multiple passes near the end).
+      if [ "$edges_now" -eq "$edges_at_start" ]; then
+        echo "no .ninja_log progress this pass (still ${edges_now}); likely long link — skipping checkpoint kill, waiting for completion"
+        deadline=$(( SECONDS + budget ))
+        next_heartbeat=$(( SECONDS + HEARTBEAT_SECONDS ))
+        continue
+      fi
       echo "pass reached its ${budget}s budget; pausing ninja to checkpoint"
       kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
       # Ninja sometimes ignores TERM while compiler children finish; a blocking
