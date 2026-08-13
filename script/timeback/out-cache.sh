@@ -118,10 +118,12 @@ save() {
     return 0
   fi
 
-  # gn recreates xcode_links on the next pass; delete it before upload so aws s3
-  # sync does not traverse the SDK's recursive/broken symlinks (which makes the
-  # checkpoint fail even with --exclude).
-  rm -rf "$OUT_DIR/xcode_links"
+  # Delete before upload so aws s3 sync will not traverse the SDK's recursive
+  # symlinks (even with --exclude it can still follow them and hang/fail).
+  # Caller / build-resumable MUST recreate via ensure-xcode-links.sh before the
+  # next ninja — gn does not recreate this tree for us on resume.
+  echo "removing xcode_links before S3 sync (recreate before next ninja)"
+  command rm -rf "$OUT_DIR/xcode_links"
 
   # Default: do NOT --delete. A failed ninja pass can leave generated *.ninja
   # fragments briefly absent; sync --delete then permanently purged them from S3
