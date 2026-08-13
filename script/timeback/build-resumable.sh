@@ -118,11 +118,38 @@ run_build() {
     run_ninja_target electron:electron_framework || return $?
     echo "=== phase A complete ==="
   fi
-  echo "=== phase B: electron (full) ==="
-  if [ -n "${NINJA_J:-}" ]; then
-    CI=1 GN_EXTRA_ARGS="$(gn_extra_args)" e build --no-remote -j "$NINJA_J" 2>&1
+
+  # Helpers link with -F. -framework "Electron Framework". If the bundle is
+  # missing, fail here instead of racing into Helper.
+  if [ ! -d "${out}/Electron Framework.framework" ]; then
+    echo "ERROR: Electron Framework.framework missing after phase A at ${out}" >&2
+    ls -la "$out" | head -50 >&2 || true
+    return 1
+  fi
+
+  # Do NOT use `e build` for phase B: it re-detects the live macOS SDK and can
+  # re-enter gn / dirty the framework, then Helper links in parallel while the
+  # bundle is briefly absent ("framework not found for -framework Electron
+  # Framework"). Drive ninja directly against the restored graph.
+  local phase_b_j="${NINJA_J:-}"
+  local remain_file remain
+  remain_file="$(mktemp)"
+  if ninja -C "$out" -n electron >"$remain_file" 2>&1; then
+    remain="$(wc -l < "$remain_file" | tr -d ' ')"
+    echo "phase B dry-run: ${remain} lines"
+    # Final link cluster is small; -j1 prevents Helper/Framework TOC races.
+    if [ "$remain" -gt 0 ] && [ "$remain" -lt 500 ]; then
+      echo "phase B: serializing final links (-j1; ${remain} dry-run lines)"
+      phase_b_j=1
+    fi
+  fi
+  rm -f "$remain_file"
+
+  echo "=== phase B: ninja electron (j=${phase_b_j:-default}) ==="
+  if [ -n "$phase_b_j" ]; then
+    ninja -C "$out" -j "$phase_b_j" electron 2>&1
   else
-    CI=1 GN_EXTRA_ARGS="$(gn_extra_args)" e build --no-remote 2>&1
+    ninja -C "$out" electron 2>&1
   fi
 }
 
