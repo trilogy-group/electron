@@ -58,7 +58,53 @@ checkpoint_interval_for_pass() {
 # which is how the 32-vCPU Windows box gets oversubscribed. macOS bash is 3.2, where
 # expanding an empty array under `set -u` is an error, so branch on the variable
 # instead of building an args array.
+#
+# Helpers link with `-framework "Electron Framework"` via `:electron_framework+link`.
+# That +link edge is TOC-based, so ninja can schedule Electron Helper in parallel
+# with Framework SOLINK. SOLINK removes the old bundle at start → Helper fails with
+# "framework not found for -framework Electron Framework" (seen at edges~489758).
+# Finish the framework target before asking for the full electron build.
+run_ninja_target() {
+  local target="$1"
+  local out="${OUT_DIR:-src/out/Release}"
+  if [ -n "${NINJA_J:-}" ]; then
+    ninja -C "$out" -j "$NINJA_J" "$target" 2>&1
+  else
+    ninja -C "$out" "$target" 2>&1
+  fi
+}
+
+electron_framework_needs_work() {
+  local out="${OUT_DIR:-src/out/Release}"
+  local dry
+  dry="$(mktemp)"
+  if ! ninja -C "$out" -n electron:electron_framework >"$dry" 2>&1; then
+    echo "electron_framework dry-run failed; will still attempt phase A"
+    cat "$dry" || true
+    rm -f "$dry"
+    return 0
+  fi
+  if grep -q "no work to do" "$dry"; then
+    rm -f "$dry"
+    return 1
+  fi
+  if [ "$(wc -l < "$dry" | tr -d ' ')" -eq 0 ]; then
+    rm -f "$dry"
+    return 1
+  fi
+  echo "electron_framework dry-run: $(wc -l < "$dry" | tr -d ' ') lines"
+  tail -n 5 "$dry" || true
+  rm -f "$dry"
+  return 0
+}
+
 run_build() {
+  if electron_framework_needs_work; then
+    echo "=== phase A: electron:electron_framework (before Helper links) ==="
+    run_ninja_target electron:electron_framework || return $?
+    echo "=== phase A complete ==="
+  fi
+  echo "=== phase B: electron (full) ==="
   if [ -n "${NINJA_J:-}" ]; then
     CI=1 GN_EXTRA_ARGS="$(gn_extra_args)" e build --no-remote -j "$NINJA_J" 2>&1
   else
