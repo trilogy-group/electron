@@ -29,6 +29,14 @@ readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 snapshot() {
   "$SCRIPT_DIR/out-cache.sh" save || echo "snapshot failed; continuing anyway"
+  # save() removes xcode_links so aws s3 sync will not traverse the SDK tree.
+  # Recreate the hermetic pin before the next ninja pass or crashpad mig fails
+  # with missing xcode_links/.../exc.defs.
+  local out="${OUT_DIR:-src/out/Release}"
+  if [ -d "$out" ]; then
+    bash "$SCRIPT_DIR/ensure-xcode-links.sh" "$out" \
+      || echo "ensure-xcode-links after checkpoint failed; next pass may error"
+  fi
 }
 
 gn_extra_args() {
@@ -99,6 +107,12 @@ electron_framework_needs_work() {
 }
 
 run_build() {
+  # Defensive: checkpoints delete xcode_links; ensure the hermetic SDK pin exists
+  # before every ninja invocation (cheap if already linked).
+  local out="${OUT_DIR:-src/out/Release}"
+  if [ -d "$out" ]; then
+    bash "$SCRIPT_DIR/ensure-xcode-links.sh" "$out" || return $?
+  fi
   if electron_framework_needs_work; then
     echo "=== phase A: electron:electron_framework (before Helper links) ==="
     run_ninja_target electron:electron_framework || return $?
