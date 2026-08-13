@@ -240,21 +240,72 @@ if [ -d "$OUT" ] && [ "${USE_OUT_CACHE:-true}" = "true" ]; then
 
     python3 "$SCRIPT_DIR/restore-output-mtimes-from-deps.py" "$OUT"
 
-    # Regenerate missing gn/ninja fragments without discarding *.o. A prior
-    # checkpoint with aws s3 sync --delete can purge obj/**/*.ninja that were
-    # transiently absent mid-failure (e.g. obj/v8/v8_flags.ninja).
+    # Restore missing obj/**/*.ninja without rewriting Release's build.ninja.
+    # In-place `gn gen` fails: manual xcode_links under //out look like undeclared
+    # generated inputs (crashpad mig .defs). Side-gen with an absolute hermetic
+    # mac_sdk_path avoids that; we only copy fragments that are absent.
     repair_missing_ninja_fragments() {
       local out="$1"
-      local src_dir out_name
+      local src_dir out_name hermetic fix_rel fix_dir args_src sdk_name copied
       src_dir="$(cd "$(dirname "$out")/.." && pwd)"
       out_name="$(basename "$out")"
-      echo "=== repairing ninja via gn gen (cwd=${src_dir}, out=out/${out_name}) ==="
-      if command -v gn >/dev/null 2>&1; then
-        (cd "$src_dir" && gn gen "out/${out_name}") || return 1
-      else
+      fix_rel="out/${out_name}__ninja_repair"
+      fix_dir="${src_dir}/${fix_rel}"
+      args_src="${out}/args.gn"
+      if [ ! -f "$args_src" ]; then
+        echo "repair: missing $args_src" >&2
+        return 1
+      fi
+      if ! command -v gn >/dev/null 2>&1; then
         echo "gn not on PATH; cannot repair missing ninja fragments" >&2
         return 1
       fi
+
+      sdk_name="$(sed -n 's/.*xcode_links\/electron\/\([^"/]*\)".*/\1/p' "$args_src" | head -1)"
+      sdk_name="${sdk_name:-MacOSX26.4.sdk}"
+      hermetic="${HOME}/.electron_build_tools/third_party/SDKs/${sdk_name}"
+      if [ ! -d "$hermetic" ]; then
+        echo "repair: hermetic SDK missing at $hermetic" >&2
+        return 1
+      fi
+
+      echo "=== repairing missing ninja via side gn gen (${fix_rel}, sdk=${hermetic}) ==="
+      rm -rf "$fix_dir"
+      mkdir -p "$fix_dir"
+      # Absolute SDK path (outside //out) so gn does not require xcode_links generators.
+      sed "s|^mac_sdk_path = \".*\"|mac_sdk_path = \"${hermetic}\"|" "$args_src" >"${fix_dir}/args.gn"
+      if ! grep -q "^mac_sdk_path = \"${hermetic}\"$" "${fix_dir}/args.gn"; then
+        echo "mac_sdk_path = \"${hermetic}\"" >>"${fix_dir}/args.gn"
+      fi
+
+      if ! (cd "$src_dir" && gn gen "$fix_rel"); then
+        echo "repair: side gn gen failed" >&2
+        rm -rf "$fix_dir"
+        return 1
+      fi
+
+      copied=0
+      while IFS= read -r -d '' f; do
+        rel="${f#${fix_dir}/}"
+        case "$rel" in
+          build.ninja|toolchain.ninja|build.ninja.stamp|*.ninja.d) continue ;;
+        esac
+        if [ ! -f "${out}/${rel}" ]; then
+          mkdir -p "$(dirname "${out}/${rel}")"
+          cp "$f" "${out}/${rel}"
+          copied=$((copied + 1))
+          echo "restored missing ${rel}"
+        fi
+      done < <(find "$fix_dir" -type f -name '*.ninja' -print0 2>/dev/null)
+
+      echo "repair: restored ${copied} missing ninja fragments"
+      rm -rf "$fix_dir"
+
+      if [ "$copied" -eq 0 ]; then
+        echo "repair: side gen produced no missing fragments to copy" >&2
+        return 1
+      fi
+
       bash "$SCRIPT_DIR/ensure-xcode-links.sh" "$out" || return 1
       if [ -d "$out/gen" ]; then
         find "$out/gen" -type f -print0 | xargs -0 touch -t "${SRC_MTIME_STAMP:-202001010000}"
@@ -267,10 +318,14 @@ if [ -d "$OUT" ] && [ "${USE_OUT_CACHE:-true}" = "true" ]; then
       echo "ninja dry-run failed; dumping output"
       cat "$dry_file" || true
       if grep -q "loading '.*\\.ninja': No such file" "$dry_file"; then
-        echo "missing subninja detected — attempting gn gen repair"
-        if repair_missing_ninja_fragments "$OUT" \
-          && ninja -C "$OUT" -n electron >"$dry_file" 2>&1; then
-          echo "ninja dry-run OK after gn gen repair"
+        echo "missing subninja detected — attempting side-gn ninja fragment repair"
+        if ! repair_missing_ninja_fragments "$OUT"; then
+          echo "repair failed" >&2
+          rm -f "$dry_file"
+          exit 1
+        fi
+        if ninja -C "$OUT" -n electron >"$dry_file" 2>&1; then
+          echo "ninja dry-run OK after ninja fragment repair"
         else
           echo "ninja dry-run still failing after repair"
           cat "$dry_file" || true
