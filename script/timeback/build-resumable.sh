@@ -240,12 +240,47 @@ if [ -d "$OUT" ] && [ "${USE_OUT_CACHE:-true}" = "true" ]; then
 
     python3 "$SCRIPT_DIR/restore-output-mtimes-from-deps.py" "$OUT"
 
+    # Regenerate missing gn/ninja fragments without discarding *.o. A prior
+    # checkpoint with aws s3 sync --delete can purge obj/**/*.ninja that were
+    # transiently absent mid-failure (e.g. obj/v8/v8_flags.ninja).
+    repair_missing_ninja_fragments() {
+      local out="$1"
+      local src_dir out_name
+      src_dir="$(cd "$(dirname "$out")/.." && pwd)"
+      out_name="$(basename "$out")"
+      echo "=== repairing ninja via gn gen (cwd=${src_dir}, out=out/${out_name}) ==="
+      if command -v gn >/dev/null 2>&1; then
+        (cd "$src_dir" && gn gen "out/${out_name}") || return 1
+      else
+        echo "gn not on PATH; cannot repair missing ninja fragments" >&2
+        return 1
+      fi
+      bash "$SCRIPT_DIR/ensure-xcode-links.sh" "$out" || return 1
+      if [ -d "$out/gen" ]; then
+        find "$out/gen" -type f -print0 | xargs -0 touch -t "${SRC_MTIME_STAMP:-202001010000}"
+      fi
+      python3 "$SCRIPT_DIR/restore-output-mtimes-from-deps.py" "$out" || return 1
+    }
+
     dry_file="$(mktemp)"
     if ! ninja -C "$OUT" -n electron >"$dry_file" 2>&1; then
       echo "ninja dry-run failed; dumping output"
       cat "$dry_file" || true
-      rm -f "$dry_file"
-      exit 1
+      if grep -q "loading '.*\\.ninja': No such file" "$dry_file"; then
+        echo "missing subninja detected — attempting gn gen repair"
+        if repair_missing_ninja_fragments "$OUT" \
+          && ninja -C "$OUT" -n electron >"$dry_file" 2>&1; then
+          echo "ninja dry-run OK after gn gen repair"
+        else
+          echo "ninja dry-run still failing after repair"
+          cat "$dry_file" || true
+          rm -f "$dry_file"
+          exit 1
+        fi
+      else
+        rm -f "$dry_file"
+        exit 1
+      fi
     fi
     dry_lines="$(wc -l < "$dry_file" | tr -d ' ')"
     echo "ninja -n electron: $dry_lines planned steps (gate max ${RESUME_DRY_RUN_MAX})"

@@ -123,11 +123,19 @@ save() {
   # checkpoint fail even with --exclude).
   rm -rf "$OUT_DIR/xcode_links"
 
-  # --delete keeps the mirror from accumulating outputs ninja has dropped, and
-  # --exclude keeps the stamp itself out of the mirror.
+  # Default: do NOT --delete. A failed ninja pass can leave generated *.ninja
+  # fragments briefly absent; sync --delete then permanently purged them from S3
+  # (seen: obj/v8/v8_flags.ninja missing → next resume cannot load toolchain.ninja).
+  # Opt in with OUT_CACHE_SYNC_DELETE=true only for intentional mirror pruning.
+  local sync_args=("${SYNC_FLAGS[@]}" "${CACHE_EXCLUDES[@]}" --exclude "$(basename "$stamp")")
+  if [ "${OUT_CACHE_SYNC_DELETE:-false}" = "true" ]; then
+    echo "checkpointing with --delete (OUT_CACHE_SYNC_DELETE=true)"
+    sync_args+=(--delete)
+  else
+    echo "checkpointing without --delete (set OUT_CACHE_SYNC_DELETE=true to prune remote)"
+  fi
   echo "checkpointing changed files in $OUT_DIR -> ${OUT_CACHE_PREFIX}"
-  if ! aws s3 sync "$OUT_DIR" "$S3_URI" "${SYNC_FLAGS[@]}" \
-       --delete "${CACHE_EXCLUDES[@]}" --exclude "$(basename "$stamp")"; then
+  if ! aws s3 sync "$OUT_DIR" "$S3_URI" "${sync_args[@]}"; then
     echo "checkpoint upload failed"
     return 1
   fi
